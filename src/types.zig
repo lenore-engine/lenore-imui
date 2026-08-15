@@ -1,15 +1,15 @@
 const std = @import("std");
+const res = @import("lenore-resources");
 
-// The geometry and colour the draw list is written in, and the whole of what
-// the module that draws it has to agree with. Nothing here names a graphics
-// API: the renderer reads these declarations, and that direction is what keeps
-// the dependency from existing in the other one.
+// The geometry and colour this module owns: the space a caller lays out in, the
+// encoding a theme is written in, and the framebuffer position both are
+// resolved against.
 //
-// Coordinates are framebuffer pixels, origin at the top left, Y increasing
-// downward. That is the raster's own orientation and the one a scissor
-// rectangle is expressed in, so a clip travels to the device without a flip. A
-// resolution-independent coordinate is a `LogicalRect` and reaches this space
-// only through an explicit `ScaleFactor`.
+// What crosses to whoever draws the list is not here. The vertex, the draw
+// command, the clip rectangle and the image handle are `lenore-resources`
+// declarations, so that this module and the renderer share a vocabulary without
+// either naming the other. This file holds what turns an author's values into
+// that vocabulary, and what the module needs on its own side of it.
 
 pub const ConversionError = error{
     InvalidLogicalRect,
@@ -49,50 +49,25 @@ pub const ScaleFactor = struct {
     }
 };
 
-// A rectangle in framebuffer pixels.
+// An extent in the space a caller lays out in, with no position.
 //
-// Validity is established where a rectangle enters from outside and is not
-// re-checked afterwards. That matters more here than the predicate suggests:
-// `isEmpty` is a `<=` comparison, so a NaN extent reports itself as non-empty,
-// and `intersection` is built from `@min` and `@max`, which return the operand
-// that is not NaN. A NaN therefore does not propagate and does not announce
-// itself either. It is stopped at the boundary or not at all.
-pub const Rect = struct {
-    x: f32,
-    y: f32,
+// Separate from `LogicalRect` because measurement and placement are separate
+// passes over a layout tree: what a widget wants is a size, and where it goes
+// is decided a pass later by whoever owns the space.
+pub const LogicalSize = struct {
     width: f32,
     height: f32,
 
-    pub const zero: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    pub const zero: LogicalSize = .{ .width = 0, .height = 0 };
 
-    pub fn isValid(self: Rect) bool {
-        return std.math.isFinite(self.x) and std.math.isFinite(self.y) and
-            std.math.isFinite(self.width) and std.math.isFinite(self.height) and
+    pub fn isValid(self: LogicalSize) bool {
+        return std.math.isFinite(self.width) and std.math.isFinite(self.height) and
             self.width >= 0 and self.height >= 0;
-    }
-
-    pub fn isEmpty(self: Rect) bool {
-        return self.width <= 0 or self.height <= 0;
-    }
-
-    // Clipping is intersection only, so a child can never draw outside its
-    // parent. A disjoint pair yields an empty rectangle at the near corner
-    // rather than a negative extent.
-    pub fn intersection(a: Rect, b: Rect) Rect {
-        const left = @max(a.x, b.x);
-        const top = @max(a.y, b.y);
-        const right = @min(a.x + a.width, b.x + b.width);
-        const bottom = @min(a.y + a.height, b.y + b.height);
-        return .{
-            .x = left,
-            .y = top,
-            .width = @max(right - left, 0),
-            .height = @max(bottom - top, 0),
-        };
     }
 };
 
-// A rectangle in the resolution-independent space a caller lays out in.
+// A rectangle in the resolution-independent space a caller lays out in. It
+// reaches the draw list only through the conversion below.
 pub const LogicalRect = struct {
     x: f32,
     y: f32,
@@ -112,7 +87,7 @@ pub const LogicalRect = struct {
     //
     // This is the conversion for something being filled. A stroke or a text
     // origin wants its own rule and does not have one yet.
-    pub fn toFramebufferFilled(self: LogicalRect, scale: ScaleFactor) ConversionError!Rect {
+    pub fn toFramebufferFilled(self: LogicalRect, scale: ScaleFactor) ConversionError!res.Rect {
         if (!self.isValid()) return error.InvalidLogicalRect;
         try scale.validate();
 
@@ -133,6 +108,33 @@ pub const LogicalRect = struct {
     }
 };
 
+// A position in framebuffer pixels, which is the space a pointer arrives in and
+// the space a region is tested in.
+//
+// There is no logical counterpart, because nothing lays a position out. A
+// rectangle is authored in logical space and converted; a position comes from
+// the window already in pixels and is only ever compared against the result.
+pub const Point = struct {
+    x: f32,
+    y: f32,
+
+    // Half-open on both axes: the left and top edges belong to the rectangle
+    // and the right and bottom do not. Two rectangles sharing an edge therefore
+    // share no position, so a pointer on the seam between adjacent widgets is
+    // inside exactly one of them.
+    //
+    // This is the one geometry predicate in the module that takes no error
+    // path, and the arithmetic is why. Both comparisons are false when either
+    // operand is NaN, and a negative extent puts the upper bound below the
+    // lower one, so a rectangle or a position that is not finite contains
+    // nothing rather than everything. A validity check here would change no
+    // answer.
+    pub fn isInside(self: Point, rect: res.Rect) bool {
+        return self.x >= rect.x and self.y >= rect.y and
+            self.x < rect.x + rect.width and self.y < rect.y + rect.height;
+    }
+};
+
 // The sub-image a quad samples, as normalised coordinates. The default is the
 // whole image, which is what a solid fill against the white image wants.
 pub const UvRect = struct {
@@ -144,9 +146,15 @@ pub const UvRect = struct {
 
 // Colour as a theme authors it: straight alpha, sRGB encoded.
 //
-// Kept apart from the linear premultiplied form rather than converted in place,
-// so that an unconverted colour cannot be written into a vertex. The two are
+// Kept apart from the premultiplied form rather than converted in place, so
+// that an unconverted colour cannot be written into a vertex. The two are
 // different quantities and the type system is where that is cheapest to say.
+//
+// Both are sRGB encoded, and that is the overlay's contract rather than an
+// omission. What the draw list carries is what the display shows: the pass
+// composites onto an image the tone operator has already encoded, and blending
+// a glyph's coverage against display values is what puts a half-covered edge
+// half way up the scale a reader sees.
 pub const SrgbColor = struct {
     r: f32,
     g: f32,
@@ -206,87 +214,21 @@ pub const SrgbColor = struct {
     pub fn withAlpha(self: SrgbColor, alpha: f32) SrgbColor {
         return .{ .r = self.r, .g = self.g, .b = self.b, .a = alpha };
     }
-};
 
-// Colour as the vertex carries it: linear, premultiplied by alpha.
-//
-// Premultiplied because it is the only encoding under which compositing is
-// associative. A glyph over a translucent fill over a panel over the scene
-// reduces to the same result whatever order the pairs are taken in, and the
-// place straight alpha breaks that is exactly where a UI spends its time.
-//
-// f16 rather than a linear `unorm8`, and the reason is arithmetic rather than
-// caution. One `unorm8` step is 1/255. The sRGB decode below divides its toe by
-// 12.92, so sRGB code 1 decodes to a linear 1/255/12.92; one linear `unorm8`
-// step therefore spans 12.92 sRGB code values near black, and a dark panel
-// bands at every one of them. An f16 significand is eleven bits, which puts its
-// spacing there orders of magnitude below what the encoding can express.
-pub const LinearPremultipliedColor = extern struct {
-    rgba: [4]f16,
-
-    pub const transparent: LinearPremultipliedColor = .{ .rgba = .{ 0, 0, 0, 0 } };
-
+    // Into the encoding a vertex carries: the same channels, scaled by alpha.
+    //
     // Every channel passes through a clamp, and `std.math.clamp` is
     // `@max(lower, @min(upper, value))` where `@min` and `@max` return the
     // operand that is not NaN. A non-finite input therefore leaves here as a
     // bound rather than as itself, which is what lets the draw list carry no
     // per-vertex colour check.
-    pub fn fromSrgb(colour: SrgbColor) LinearPremultipliedColor {
-        const alpha = std.math.clamp(colour.a, 0, 1);
+    pub fn premultiplied(self: SrgbColor) res.PremultipliedColor {
+        const alpha = std.math.clamp(self.a, 0, 1);
         return .{ .rgba = .{
-            @floatCast(srgbToLinear(colour.r) * alpha),
-            @floatCast(srgbToLinear(colour.g) * alpha),
-            @floatCast(srgbToLinear(colour.b) * alpha),
+            @floatCast(std.math.clamp(self.r, 0, 1) * alpha),
+            @floatCast(std.math.clamp(self.g, 0, 1) * alpha),
+            @floatCast(std.math.clamp(self.b, 0, 1) * alpha),
             @floatCast(alpha),
         } };
-    }
-
-    pub const white: LinearPremultipliedColor = .{ .rgba = .{ 1, 1, 1, 1 } };
-};
-
-// Khronos Data Format Specification v1.3, section 13.3.1 "sRGB EOTF": below the
-// threshold the encoding is divided by 12.92, above it the offset encoding is
-// raised to 2.4.
-fn srgbToLinear(channel: f32) f32 {
-    const value = std.math.clamp(channel, 0, 1);
-    return if (value <= 0.04045)
-        value / 12.92
-    else
-        std.math.pow(f32, (value + 0.055) / 1.055, 2.4);
-}
-
-// A sampled image, resolved only by whoever registered it.
-//
-// The width is the resource pool's on the other side: an index and a generation
-// packed into one word, with zero reserved. A zero-initialised draw command
-// therefore names nothing live rather than aliasing the first slot.
-pub const ImageHandle = enum(u64) {
-    invalid = 0,
-    _,
-
-    pub fn isValid(self: ImageHandle) bool {
-        return self != .invalid;
-    }
-};
-
-// One indexed vertex, in the layout the vertex stage declares.
-//
-// Position and UV stay f32 so that neither depends on the framebuffer extent
-// nor on the size of the image being sampled. Narrowing them would save eight
-// bytes a vertex, which on a dense frame is a fraction of one frame's colour
-// traffic and does not pay for a decode in the vertex stage.
-pub const Vertex = extern struct {
-    position: [2]f32,
-    uv: [2]f32,
-    colour: LinearPremultipliedColor,
-
-    // Inside the struct rather than at file scope, so it is analysed when
-    // something resolves this layout, which is every consumer that matters. The
-    // shader declares its attributes at these offsets.
-    comptime {
-        std.debug.assert(@sizeOf(Vertex) == 24);
-        std.debug.assert(@offsetOf(Vertex, "position") == 0);
-        std.debug.assert(@offsetOf(Vertex, "uv") == 8);
-        std.debug.assert(@offsetOf(Vertex, "colour") == 16);
     }
 };

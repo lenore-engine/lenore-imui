@@ -4,8 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const resource = b.dependency("lenore_resources", .{ .target = target, .optimize = optimize });
+
     const mod = b.addModule("lenore-imui", .{
         .root_source_file = b.path("src/root.zig"),
+        .imports = &.{
+            .{ .name = "lenore-resources", .module = resource.module("lenore-resources") },
+        },
         .target = target,
         .optimize = optimize,
     });
@@ -15,6 +20,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = testRoot(b, "tests"),
             .imports = &.{
                 .{ .name = "lenore-imui", .module = mod },
+                .{ .name = "lenore-resources", .module = resource.module("lenore-resources") },
             },
             .target = target,
             .optimize = optimize,

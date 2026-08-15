@@ -1,95 +1,61 @@
 const std = @import("std");
 const imui = @import("lenore-imui");
+const res = @import("lenore-resources");
 
 const testing = std.testing;
 
-const Rect = imui.Rect;
 const LogicalRect = imui.LogicalRect;
+const Point = imui.Point;
 const ScaleFactor = imui.ScaleFactor;
 const SrgbColor = imui.SrgbColor;
-const LinearPremultipliedColor = imui.LinearPremultipliedColor;
-const Vertex = imui.Vertex;
 
 // f16 carries an eleven-bit significand, so a value near 1 is exact to about
 // 5e-4. Everything compared here is a colour channel in [0, 1].
 const f16_tolerance = 1e-3;
 
-fn linear(colour: LinearPremultipliedColor, channel: usize) f32 {
+fn channelOf(colour: res.PremultipliedColor, channel: usize) f32 {
     return @floatCast(colour.rgba[channel]);
 }
 
-test "the vertex layout is the one the shader declares" {
-    // Reading the layout is what analyses the comptime block inside `Vertex`.
-    // Without a consumer that resolves the struct, those asserts never run.
-    try testing.expectEqual(24, @sizeOf(Vertex));
-    try testing.expectEqual(0, @offsetOf(Vertex, "position"));
-    try testing.expectEqual(8, @offsetOf(Vertex, "uv"));
-    try testing.expectEqual(16, @offsetOf(Vertex, "colour"));
+fn opaqueGrey(value: f32) res.PremultipliedColor {
+    return (SrgbColor{ .r = value, .g = value, .b = value }).premultiplied();
 }
 
-test "the sRGB decode meets the specification at both ends and at its knee" {
-    // Khronos Data Format Specification v1.3, 13.3.1. The endpoints are fixed
-    // points of the function, and the knee is where the two branches meet:
-    // 0.04045 / 12.92 is 0.0031308, which is the threshold section 13.3.2 uses
-    // for the inverse.
-    const black = LinearPremultipliedColor.fromSrgb(.{ .r = 0, .g = 0, .b = 0 });
-    try testing.expectEqual(0, linear(black, 0));
-
-    const white = LinearPremultipliedColor.fromSrgb(.{ .r = 1, .g = 1, .b = 1 });
-    try testing.expectApproxEqAbs(1, linear(white, 0), f16_tolerance);
-
-    const knee = LinearPremultipliedColor.fromSrgb(.{ .r = 0.04045, .g = 0, .b = 0 });
-    try testing.expectApproxEqAbs(0.0031308, linear(knee, 0), 1e-5);
-
-    const half = LinearPremultipliedColor.fromSrgb(.{ .r = 0.5, .g = 0, .b = 0 });
-    try testing.expectApproxEqAbs(0.21404114, linear(half, 0), f16_tolerance);
-}
-
-test "the decode is monotonic across the branch boundary" {
-    var previous: f32 = -1;
-    var step: u16 = 0;
-    while (step <= 255) : (step += 1) {
-        const encoded = @as(f32, @floatFromInt(step)) / 255.0;
-        const value = linear(LinearPremultipliedColor.fromSrgb(.{
-            .r = encoded,
-            .g = 0,
-            .b = 0,
-        }), 0);
-        try testing.expect(value > previous);
-        previous = value;
-    }
+test "a channel reaches the vertex as it was authored" {
+    // The draw list is composited onto a picture already encoded for display,
+    // so an authored channel is the value the display shows and nothing here
+    // converts it. A transfer function applied on this path would put a glyph's
+    // half-covered edge well above half the scale a reader sees.
+    try testing.expectEqual(0, channelOf(opaqueGrey(0), 0));
+    try testing.expectApproxEqAbs(1, channelOf(opaqueGrey(1), 0), f16_tolerance);
+    try testing.expectApproxEqAbs(0.5, channelOf(opaqueGrey(0.5), 0), f16_tolerance);
+    try testing.expectApproxEqAbs(0.04045, channelOf(opaqueGrey(0.04045), 0), f16_tolerance);
 }
 
 test "alpha multiplies the colour channels and is carried alongside" {
-    const opaque_half = LinearPremultipliedColor.fromSrgb(.{ .r = 0.5, .g = 0.5, .b = 0.5 });
-    const washed = LinearPremultipliedColor.fromSrgb(
-        (SrgbColor{ .r = 0.5, .g = 0.5, .b = 0.5 }).withAlpha(0.5),
-    );
+    const full = opaqueGrey(0.5);
+    const washed = (SrgbColor{ .r = 0.5, .g = 0.5, .b = 0.5 }).withAlpha(0.5).premultiplied();
 
-    try testing.expectApproxEqAbs(1, linear(opaque_half, 3), f16_tolerance);
-    try testing.expectApproxEqAbs(0.5, linear(washed, 3), f16_tolerance);
+    try testing.expectApproxEqAbs(1, channelOf(full, 3), f16_tolerance);
+    try testing.expectApproxEqAbs(0.5, channelOf(washed, 3), f16_tolerance);
     // Premultiplied: half the coverage is half the emitted colour.
-    try testing.expectApproxEqAbs(
-        linear(opaque_half, 0) * 0.5,
-        linear(washed, 0),
-        f16_tolerance,
-    );
+    try testing.expectApproxEqAbs(channelOf(full, 0) * 0.5, channelOf(washed, 0), f16_tolerance);
 }
 
 test "a non-finite channel leaves the conversion as a bound, never as itself" {
     // This is what lets the draw list carry no per-vertex colour check, so it
     // is pinned here rather than left to `std.math.clamp` staying as it is.
     const nan = std.math.nan(f32);
-    const poisoned = LinearPremultipliedColor.fromSrgb(.{ .r = nan, .g = -1, .b = 2, .a = nan });
+    const poisoned = (SrgbColor{ .r = nan, .g = -1, .b = 2, .a = nan }).premultiplied();
 
     for (poisoned.rgba) |channel| {
         try testing.expect(std.math.isFinite(@as(f32, @floatCast(channel))));
     }
     // A NaN clamps to the upper bound, so the alpha is opaque and the red
     // channel is full rather than zero.
-    try testing.expectApproxEqAbs(1, linear(poisoned, 3), f16_tolerance);
-    try testing.expectApproxEqAbs(1, linear(poisoned, 0), f16_tolerance);
-    try testing.expectEqual(0, linear(poisoned, 1));
+    try testing.expectApproxEqAbs(1, channelOf(poisoned, 3), f16_tolerance);
+    try testing.expectApproxEqAbs(1, channelOf(poisoned, 0), f16_tolerance);
+    try testing.expectEqual(0, channelOf(poisoned, 1));
 }
 
 test "hex authoring accepts both lengths and an optional hash" {
@@ -166,18 +132,32 @@ test "a conversion that leaves the finite range is an error, not a saturation" {
     try testing.expectError(error.ConversionOverflow, wide.toFramebufferFilled(scale));
 }
 
-test "intersection nests and disjoint rectangles come back empty" {
-    const parent: Rect = .{ .x = 0, .y = 0, .width = 100, .height = 100 };
-    const child: Rect = .{ .x = 50, .y = 50, .width = 100, .height = 100 };
-    const nested = Rect.intersection(parent, child);
-    try testing.expectEqual(50, nested.x);
-    try testing.expectEqual(50, nested.width);
-    try testing.expect(!nested.isEmpty());
+test "containment takes the near edges and not the far ones" {
+    const rect: res.Rect = .{ .x = 10, .y = 20, .width = 30, .height = 40 };
 
-    const elsewhere: Rect = .{ .x = 200, .y = 200, .width = 10, .height = 10 };
-    const disjoint = Rect.intersection(parent, elsewhere);
-    try testing.expect(disjoint.isEmpty());
-    // An empty result never carries a negative extent, which a scissor would
-    // have to reject rather than interpret.
-    try testing.expect(disjoint.width >= 0 and disjoint.height >= 0);
+    try testing.expect((Point{ .x = 10, .y = 20 }).isInside(rect));
+    try testing.expect((Point{ .x = 39.999, .y = 59.999 }).isInside(rect));
+    try testing.expect(!(Point{ .x = 40, .y = 40 }).isInside(rect));
+    try testing.expect(!(Point{ .x = 20, .y = 60 }).isInside(rect));
+    try testing.expect(!(Point{ .x = 9.999, .y = 40 }).isInside(rect));
+}
+
+// The property `Point.isInside` claims in place of a validity check, and the
+// reason `Region.contains` checks no geometry. Every comparison it is built
+// from is false for a NaN operand, and a negative extent puts the upper bound
+// below the lower one.
+test "containment is false rather than true where the geometry is ill-formed" {
+    const nan = std.math.nan(f32);
+    const sound: res.Rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 };
+
+    try testing.expect(!(Point{ .x = nan, .y = 5 }).isInside(sound));
+    try testing.expect(!(Point{ .x = 5, .y = nan }).isInside(sound));
+    try testing.expect(!(Point{ .x = 5, .y = 5 }).isInside(.{ .x = nan, .y = 0, .width = 10, .height = 10 }));
+    try testing.expect(!(Point{ .x = 5, .y = 5 }).isInside(.{ .x = 0, .y = 0, .width = nan, .height = 10 }));
+    try testing.expect(!(Point{ .x = 5, .y = 5 }).isInside(.{ .x = 0, .y = 0, .width = -10, .height = -10 }));
+}
+
+test "an empty rectangle contains nothing, including its own corner" {
+    const empty: res.Rect = .{ .x = 10, .y = 10, .width = 0, .height = 0 };
+    try testing.expect(!(Point{ .x = 10, .y = 10 }).isInside(empty));
 }

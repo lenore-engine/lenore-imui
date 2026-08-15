@@ -3,6 +3,10 @@
     .fingerprint = 0x6267214224ccc4c3,
     .version = "0.0.1",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .lenore_resources = .{
+            .path = "../lenore-resources",
+        },
+    },
     .paths = .{ "build.zig", "build.zig.zon", "src", "tests", "LICENSE", "AUTHORS" },
 }
