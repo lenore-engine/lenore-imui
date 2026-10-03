@@ -634,3 +634,447 @@ test "a run wider than its rectangle draws past it rather than being clipped" {
     try testing.expectEqual(12, vertices.len);
     try testing.expectApproxEqAbs(narrow.x - 10, vertices[0].position[0], 1e-4);
 }
+
+// Scrolling
+
+test "a scroll offset stays inside what there is to scroll" {
+    // Content twice the view, so there is exactly one viewport of travel.
+    try testing.expectEqual(@as(f32, 30), try imui.scrollOffset(0, 30, 200, 100));
+    try testing.expectEqual(@as(f32, 100), try imui.scrollOffset(80, 40, 200, 100));
+    try testing.expectEqual(@as(f32, 0), try imui.scrollOffset(20, -50, 200, 100));
+
+    // Content no larger than the view scrolls nowhere, in either direction.
+    try testing.expectEqual(@as(f32, 0), try imui.scrollOffset(0, 30, 100, 100));
+    try testing.expectEqual(@as(f32, 0), try imui.scrollOffset(0, 30, 40, 100));
+}
+
+test "a scroll built from values that are not finite is refused" {
+    const nan = std.math.nan(f32);
+    try testing.expectError(error.InvalidRange, imui.scrollOffset(nan, 1, 200, 100));
+    try testing.expectError(error.InvalidRange, imui.scrollOffset(0, nan, 200, 100));
+    try testing.expectError(error.InvalidRange, imui.scrollOffset(0, 1, nan, 100));
+    try testing.expectError(error.InvalidRange, imui.scrollOffset(0, 1, 200, nan));
+    // A negative size is not a small one.
+    try testing.expectError(error.InvalidRange, imui.scrollOffset(0, 1, -1, 100));
+    try testing.expectError(error.InvalidRange, imui.scrollOffset(0, 1, 200, -1));
+}
+
+test "the line moves only as far as it must to show the caret" {
+    // A line of 300 in a field of 100 leaves 200 of travel.
+    try testing.expectEqual(@as(f32, 0), imui.caretScroll(0, 50, 100, 300));
+    // The caret past the right edge pulls the line just far enough.
+    try testing.expectEqual(@as(f32, 120), imui.caretScroll(0, 220, 100, 300));
+    // And past the left edge, the other way.
+    try testing.expectEqual(@as(f32, 40), imui.caretScroll(90, 40, 100, 300));
+    // A line that fits is never scrolled, whatever the offset arrived as.
+    try testing.expectEqual(@as(f32, 0), imui.caretScroll(50, 10, 100, 80));
+    // Nor past the end of one that does not.
+    try testing.expectEqual(@as(f32, 200), imui.caretScroll(500, 290, 100, 300));
+}
+
+// The text field
+
+const TextFieldState = imui.TextFieldState;
+
+fn edits(list: []const imui.Edit) []const imui.Edit {
+    return list;
+}
+
+fn insertion(bytes: []const u8) imui.Edit {
+    return .{ .insert = bytes };
+}
+
+fn stroke(which: imui.Key, shift: bool, control: bool) imui.Edit {
+    return .{ .key = .{ .key = which, .shift = shift, .control = control } };
+}
+
+// A field over `buffer`, holding `content`, with the caret at the end.
+fn field(buffer: []u8, content: []const u8) TextFieldState {
+    @memcpy(buffer[0..content.len], content);
+    return .{ .len = content.len, .caret = content.len, .anchor = content.len };
+}
+
+fn contents(buffer: []const u8, state: TextFieldState) []const u8 {
+    return buffer[0..state.len];
+}
+
+test "typing lands at the caret and moves it along" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "ac");
+    state.caret = 1;
+    state.anchor = 1;
+
+    try testing.expect(try imui.applyEdits(&buffer, &state, edits(&.{insertion("b")}), true));
+    try testing.expectEqualStrings("abc", contents(&buffer, state));
+    try testing.expectEqual(@as(usize, 2), state.caret);
+    try testing.expectEqual(@as(usize, 2), state.anchor);
+}
+
+test "typing and editing are applied in the order they arrived" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "");
+
+    // The frame the queue exists for. Applied as counts instead — two
+    // characters and one backspace — this would read "b", and it does not.
+    try testing.expect(try imui.applyEdits(&buffer, &state, edits(&.{
+        insertion("a"),
+        stroke(.backspace, false, false),
+        insertion("b"),
+    }), true));
+    try testing.expectEqualStrings("b", contents(&buffer, state));
+
+    // The other order over the same operations, for the same reason.
+    state = field(&buffer, "");
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{
+        insertion("a"),
+        insertion("b"),
+        stroke(.backspace, false, false),
+    }), true);
+    try testing.expectEqualStrings("a", contents(&buffer, state));
+}
+
+test "typing over a selection replaces it" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "hello");
+    state.anchor = 1;
+    state.caret = 4;
+
+    try testing.expect(try imui.applyEdits(&buffer, &state, edits(&.{insertion("i")}), true));
+    try testing.expectEqualStrings("hio", contents(&buffer, state));
+    try testing.expectEqual(@as(usize, 2), state.caret);
+    try testing.expect(!state.hasSelection());
+}
+
+test "a chunk that does not fit is dropped whole" {
+    var buffer: [8]u8 = undefined;
+    var state = field(&buffer, "1234567");
+
+    // A field with a full buffer stops accepting text. Taking the byte that
+    // fits out of a two-byte character is what the whole-chunk rule prevents.
+    try testing.expect(!try imui.applyEdits(&buffer, &state, edits(&.{insertion("\xc3\xa9")}), true));
+    try testing.expectEqualStrings("1234567", contents(&buffer, state));
+
+    // One byte still fits, and it goes in.
+    try testing.expect(try imui.applyEdits(&buffer, &state, edits(&.{insertion("8")}), true));
+    try testing.expectEqualStrings("12345678", contents(&buffer, state));
+}
+
+test "backspace and delete take one character, not one byte" {
+    var buffer: [32]u8 = undefined;
+    // Two-byte characters, so a field that counted bytes would leave half of
+    // one behind and every later slice would be wrong.
+    var state = field(&buffer, "áé");
+    try testing.expectEqual(@as(usize, 4), state.len);
+
+    try testing.expect(try imui.applyEdits(&buffer, &state, edits(&.{
+        stroke(.backspace, false, false),
+    }), true));
+    try testing.expectEqualStrings("á", contents(&buffer, state));
+
+    state.caret = 0;
+    state.anchor = 0;
+    try testing.expect(try imui.applyEdits(&buffer, &state, edits(&.{
+        stroke(.delete, false, false),
+    }), true));
+    try testing.expectEqualStrings("", contents(&buffer, state));
+}
+
+test "backspace and delete at the ends remove nothing and report nothing" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "ab");
+    state.caret = 0;
+    state.anchor = 0;
+
+    // A caller that saves on every change should not save because a key was
+    // pressed against the edge of the field.
+    try testing.expect(!try imui.applyEdits(&buffer, &state, edits(&.{
+        stroke(.backspace, false, false),
+    }), true));
+
+    state.caret = 2;
+    state.anchor = 2;
+    try testing.expect(!try imui.applyEdits(&buffer, &state, edits(&.{
+        stroke(.delete, false, false),
+    }), true));
+    try testing.expectEqualStrings("ab", contents(&buffer, state));
+}
+
+test "backspace over a selection takes the selection and not a character" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "hello");
+    state.anchor = 1;
+    state.caret = 4;
+
+    try testing.expect(try imui.applyEdits(&buffer, &state, edits(&.{
+        stroke(.backspace, false, false),
+    }), true));
+    try testing.expectEqualStrings("ho", contents(&buffer, state));
+    try testing.expectEqual(@as(usize, 1), state.caret);
+}
+
+test "an arrow moves by a character and shift makes it a selection" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "áb");
+
+    // Nothing moved is nothing changed, however far the caret went.
+    try testing.expect(!try imui.applyEdits(&buffer, &state, edits(&.{
+        stroke(.left, false, false),
+    }), true));
+    try testing.expectEqual(@as(usize, 2), state.caret);
+    try testing.expect(!state.hasSelection());
+
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.left, true, false)}), true);
+    // Two bytes back, because that is one character, and the anchor stayed.
+    try testing.expectEqual(@as(usize, 0), state.caret);
+    try testing.expectEqual(@as(usize, 2), state.anchor);
+    try testing.expectEqual(.{ 0, 2 }, state.selection());
+}
+
+test "an arrow without shift collapses a selection to the side it moved to" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "hello");
+    state.anchor = 1;
+    state.caret = 4;
+
+    // Right after selecting lands at the end of the selection, not one
+    // character past where the caret happened to be.
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.right, false, false)}), true);
+    try testing.expectEqual(@as(usize, 4), state.caret);
+    try testing.expect(!state.hasSelection());
+
+    state.anchor = 1;
+    state.caret = 4;
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.left, false, false)}), true);
+    try testing.expectEqual(@as(usize, 1), state.caret);
+}
+
+test "control moves by a word and takes the space beside it" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "one two  three");
+
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.left, false, true)}), true);
+    try testing.expectEqual(@as(usize, 9), state.caret);
+
+    // The two spaces go with the word before them, so a second one lands at
+    // the start of "two" rather than between the spaces.
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.left, false, true)}), true);
+    try testing.expectEqual(@as(usize, 4), state.caret);
+
+    state.caret = 0;
+    state.anchor = 0;
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.right, false, true)}), true);
+    try testing.expectEqual(@as(usize, 4), state.caret);
+}
+
+test "a word runs through characters outside ASCII" {
+    var buffer: [32]u8 = undefined;
+    // Every byte of a character outside ASCII has its high bit set, so none of
+    // them reads as a separator and the word does not break inside one.
+    var state = field(&buffer, "héllo wörld");
+
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.left, false, true)}), true);
+    try testing.expectEqualStrings("héllo ", buffer[0..state.caret]);
+}
+
+test "control with backspace takes the word" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "one two");
+
+    try testing.expect(try imui.applyEdits(&buffer, &state, edits(&.{
+        stroke(.backspace, false, true),
+    }), true));
+    try testing.expectEqualStrings("one ", contents(&buffer, state));
+}
+
+test "home and end reach the ends, and shift selects to them" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "hello");
+    state.caret = 2;
+    state.anchor = 2;
+
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.home, false, false)}), true);
+    try testing.expectEqual(@as(usize, 0), state.caret);
+    try testing.expect(!state.hasSelection());
+
+    _ = try imui.applyEdits(&buffer, &state, edits(&.{stroke(.end, true, false)}), true);
+    try testing.expectEqual(.{ 0, 5 }, state.selection());
+}
+
+test "a disabled field takes nothing, not even a caret movement" {
+    var buffer: [32]u8 = undefined;
+    var state = field(&buffer, "ab");
+
+    try testing.expect(!try imui.applyEdits(&buffer, &state, edits(&.{
+        insertion("c"),
+        stroke(.left, false, false),
+    }), false));
+    try testing.expectEqualStrings("ab", contents(&buffer, state));
+    try testing.expectEqual(@as(usize, 2), state.caret);
+}
+
+test "a state that does not describe its buffer is refused before anything slices with it" {
+    var buffer: [8]u8 = undefined;
+    const nothing = edits(&.{});
+
+    var past_buffer: TextFieldState = .{ .len = 9 };
+    try testing.expectError(
+        error.InvalidTextState,
+        imui.applyEdits(&buffer, &past_buffer, nothing, true),
+    );
+
+    var past_len: TextFieldState = .{ .len = 2, .caret = 3 };
+    try testing.expectError(
+        error.InvalidTextState,
+        imui.applyEdits(&buffer, &past_len, nothing, true),
+    );
+
+    var anchor_past_len: TextFieldState = .{ .len = 2, .caret = 1, .anchor = 3 };
+    try testing.expectError(
+        error.InvalidTextState,
+        imui.applyEdits(&buffer, &anchor_past_len, nothing, true),
+    );
+
+    // Inside a two-byte character, which is what would cut a UTF-8 sequence in
+    // half and make every later slice wrong.
+    var inside = field(&buffer, "é");
+    inside.caret = 1;
+    try testing.expectError(
+        error.InvalidTextState,
+        imui.applyEdits(&buffer, &inside, nothing, true),
+    );
+
+    var unscrolled: TextFieldState = .{ .scroll = std.math.nan(f32) };
+    try testing.expectError(
+        error.InvalidTextState,
+        imui.applyEdits(&buffer, &unscrolled, nothing, true),
+    );
+}
+
+test "the pen offset at a byte is the run summed up to it" {
+    // Three glyphs of ten, one per byte.
+    try testing.expectApproxEqAbs(0, imui.advanceTo(caption.run, 0), 1e-4);
+    try testing.expectApproxEqAbs(20, imui.advanceTo(caption.run, 2), 1e-4);
+    // Past the end is the whole run, which is where a caret at the end sits.
+    try testing.expectApproxEqAbs(30, imui.advanceTo(caption.run, 3), 1e-4);
+    try testing.expectApproxEqAbs(30, imui.advanceTo(caption.run, 99), 1e-4);
+}
+
+test "several glyphs from one byte are passed over together" {
+    // A character that shaped into two glyphs: both carry its cluster, so a
+    // caret can land before or after the pair and never between them.
+    const ligature = [_]res.ShapedGlyph{
+        .{ .index = 1, .cluster = 0, .x_advance = 10, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
+        .{ .index = 2, .cluster = 0, .x_advance = 6, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
+        .{ .index = 3, .cluster = 1, .x_advance = 10, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
+    };
+    const placements = [_]res.GlyphPlacement{ inked, inked, inked };
+    const run: res.GlyphRun = .{ .glyphs = &ligature, .placements = &placements, .buckets = .whole };
+
+    try testing.expectApproxEqAbs(0, imui.advanceTo(run, 0), 1e-4);
+    try testing.expectApproxEqAbs(16, imui.advanceTo(run, 1), 1e-4);
+}
+
+const plain_field: imui.TextFieldStyle = .{
+    .box = flat,
+    .normal_text = normal,
+    .disabled_text = disabled,
+    .selection = colour(0.7),
+    .caret = colour(0.8),
+    .caret_width = 2,
+    .padding = 4,
+};
+
+test "a focused field draws its caret and an unfocused one does not" {
+    var fixture: Fixture = .{};
+    const state: TextFieldState = .{ .len = 3, .caret = 3, .anchor = 3 };
+
+    var canvas = try fixture.started();
+    try imui.drawTextField(&canvas, plate, plain_field, state, caption, .{}, true, image);
+    const unfocused = canvas.vertexCount();
+
+    canvas = try fixture.started();
+    try imui.drawTextField(&canvas, plate, plain_field, state, caption, .{ .focused = true }, true, image);
+    // One quad more, and a quad is four vertices.
+    try testing.expectEqual(unfocused + 4, canvas.vertexCount());
+}
+
+test "a selection is drawn behind the characters it covers" {
+    var fixture: Fixture = .{};
+    const none: TextFieldState = .{ .len = 3, .caret = 3, .anchor = 3 };
+    const some: TextFieldState = .{ .len = 3, .caret = 3, .anchor = 1 };
+
+    var canvas = try fixture.started();
+    try imui.drawTextField(&canvas, plate, plain_field, none, caption, .{}, true, image);
+    const without = canvas.vertexCount();
+
+    canvas = try fixture.started();
+    try imui.drawTextField(&canvas, plate, plain_field, some, caption, .{}, true, image);
+    try testing.expectEqual(without + 4, canvas.vertexCount());
+}
+
+test "a field that leaves no room for its line draws only its box" {
+    var fixture: Fixture = .{};
+    const state: TextFieldState = .{ .len = 3, .caret = 3, .anchor = 3 };
+
+    var narrow = plain_field;
+    // Padding wider than the field itself, which the two sides stop at rather
+    // than crossing into a rectangle of negative width.
+    narrow.padding = 100;
+
+    var canvas = try fixture.started();
+    try imui.drawButton(&canvas, plate, flat, .{ .focused = true }, true, image);
+    const box_only = canvas.vertexCount();
+
+    canvas = try fixture.started();
+    try imui.drawTextField(&canvas, plate, narrow, state, caption, .{ .focused = true }, true, image);
+    // No line, no selection and no caret: a caret drawn into a field with no
+    // room for its text would sit on the border.
+    try testing.expectEqual(box_only, canvas.vertexCount());
+}
+
+test "a field is refused geometry it cannot draw" {
+    var fixture: Fixture = .{};
+    var canvas = try fixture.started();
+    const state: TextFieldState = .{ .len = 3, .caret = 3, .anchor = 3 };
+    const nan = std.math.nan(f32);
+
+    var bad = plain_field;
+    bad.padding = nan;
+    try testing.expectError(
+        error.InvalidGeometry,
+        imui.drawTextField(&canvas, plate, bad, state, caption, .{}, true, image),
+    );
+
+    bad = plain_field;
+    bad.caret_width = -1;
+    try testing.expectError(
+        error.InvalidGeometry,
+        imui.drawTextField(&canvas, plate, bad, state, caption, .{}, true, image),
+    );
+
+    var scrolled = state;
+    scrolled.scroll = nan;
+    try testing.expectError(
+        error.InvalidGeometry,
+        imui.drawTextField(&canvas, plate, plain_field, scrolled, caption, .{}, true, image),
+    );
+
+    // And nothing of the refused draw was left behind.
+    try testing.expectEqual(@as(usize, 0), canvas.vertexCount());
+}
+
+test "a position along the line answers with the byte it is nearest to" {
+    // Three glyphs of ten from three bytes, so the boundaries are at 5, 15
+    // and 25: half way through a character is where the answer changes, which
+    // is what puts the caret on the side the user aimed at.
+    try testing.expectEqual(@as(usize, 0), imui.offsetAt(caption.run, 3, 0));
+    try testing.expectEqual(@as(usize, 0), imui.offsetAt(caption.run, 3, 4.9));
+    try testing.expectEqual(@as(usize, 1), imui.offsetAt(caption.run, 3, 5));
+    try testing.expectEqual(@as(usize, 2), imui.offsetAt(caption.run, 3, 20));
+    // Past the whole run is the end of the text, which is where a click in the
+    // empty part of a field puts the caret.
+    try testing.expectEqual(@as(usize, 3), imui.offsetAt(caption.run, 3, 25));
+    try testing.expectEqual(@as(usize, 3), imui.offsetAt(caption.run, 3, 1000));
+    // And before the line is its start, however far before.
+    try testing.expectEqual(@as(usize, 0), imui.offsetAt(caption.run, 3, -50));
+}

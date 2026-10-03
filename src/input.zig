@@ -28,9 +28,26 @@ pub const PointerButton = enum { primary, secondary, middle };
 pub const ButtonAction = enum { press, release };
 pub const KeyAction = enum { press, repeat, release };
 
-// The keys a UI acts on, and no others. A text field will want characters
-// rather than keys, which is a different event and not a wider enum.
-pub const Key = enum { tab, enter, space, escape, left, right, up, down };
+// The keys a UI acts on, and no others.
+//
+// Characters are not among them, and that is what the `text` event is for: what
+// a keystroke produces depends on a layout, a modifier state and a compose
+// sequence that none of this module can see. What is here is the navigation and
+// editing whose meaning is the same on every layout.
+pub const Key = enum {
+    tab,
+    enter,
+    space,
+    escape,
+    left,
+    right,
+    up,
+    down,
+    backspace,
+    delete,
+    home,
+    end,
+};
 
 pub const PointerButtonEvent = struct {
     position: Point,
@@ -39,10 +56,53 @@ pub const PointerButtonEvent = struct {
     shift: bool = false,
 };
 
+// A motion or editing key, with the modifiers that decide what it means.
+//
+// The modifiers are here and not read off some frame-wide state because they
+// belong to the keystroke: a selection extended by one word is shift and
+// control on the arrow that extended it, and where in the frame that arrow fell
+// is what says which characters it covered.
+pub const EditKey = struct {
+    key: Key,
+    shift: bool = false,
+    control: bool = false,
+};
+
+// One thing the user did to the focused region, in the order it happened.
+//
+// Order is the whole reason this is a queue rather than a set of counters.
+// Typing, a backspace and more typing inside one frame are three operations
+// whose result depends on their sequence, and a frame is long enough to hold
+// all three whenever one stalls.
+pub const Edit = union(enum) {
+    // Committed text, pointing into the context's own buffer. Valid until the
+    // next `beginFrame`.
+    insert: []const u8,
+    key: EditKey,
+};
+
+// Which keys reach the queue, as against which the module answers itself.
+//
+// Tab moves the focus, escape drops it, and enter and space actuate: those are
+// this module's own and a field sees their result rather than the keystroke.
+// Up and down are absent because a field on one line has nowhere to take them,
+// and `Interaction.adjust` is where a widget that reads them as a value looks.
+fn isEditKey(key: Key) bool {
+    return switch (key) {
+        .left, .right, .home, .end, .backspace, .delete => true,
+        .tab, .enter, .space, .escape, .up, .down => false,
+    };
+}
+
 pub const KeyEvent = struct {
     key: Key,
     action: KeyAction,
     shift: bool = false,
+
+    // Word-wise motion and select-all, which are what a text field reads it
+    // for. Separate from `shift` rather than folded into it because the two
+    // combine: control with shift extends a selection by a word.
+    control: bool = false,
 };
 
 // What the host routes in, in framebuffer pixels.
@@ -55,6 +115,27 @@ pub const Event = union(enum) {
     pointer_move: Point,
     pointer_button: PointerButtonEvent,
     key: KeyEvent,
+
+    // Committed text, in UTF-8, for whatever holds the keyboard.
+    //
+    // Borrowed for the call. `routeEvent` copies what it takes into the
+    // context's own buffer, so the memory behind this may be reused the moment
+    // it returns.
+    //
+    // Committed, so a composition still being edited is not among them. There
+    // is no member for one because no backend driving this module produces
+    // one, and a word for something nothing can say is a word that would be
+    // wrong by the time something did.
+    text: []const u8,
+
+    // How far the wheel turned, in framebuffer pixels: positive y travels
+    // further down the content and positive x further right, which are the
+    // draw list's own axes.
+    //
+    // Pixels and not lines. A wheel reports lines, and turning a line into a
+    // distance needs a line height, which needs a face; this module has no
+    // font and the conversion belongs to whoever does.
+    scroll: Point,
 
     // The window gained or lost focus. Losing it ends any gesture in progress,
     // because the release that would have ended it will be delivered to
@@ -103,6 +184,13 @@ pub const Interaction = struct {
     // negative one.
     adjust: i32 = 0,
 
+    // What the wheel turned over this region, summed over the frame, in the
+    // units and the sense the `scroll` event carries.
+    //
+    // A distance and not a position. A frame may route several wheel events
+    // and what the region wants is how far they moved it in total.
+    scroll: Point = .{ .x = 0, .y = 0 },
+
     // Where the pointer was for whichever of the above happened. Absent when
     // the region was reached by the keyboard alone.
     pointer: ?Point = null,
@@ -148,6 +236,24 @@ pub const Error = error{
     // a hit against nothing and a hover that never clears.
     InvalidPointerPosition,
 
+    // A scroll distance that is not finite. Refused before it reaches the
+    // accumulator, which a region reads as a distance and cannot recover once
+    // a NaN has been added into it.
+    InvalidScrollDelta,
+
+    // Text that is not UTF-8, refused where it enters. Past here the bytes are
+    // handed to a shaper and to a caller's own buffer, and neither should have
+    // to carry the case.
+    InvalidText,
+
+    // One frame delivered more text than the buffer `initBuffers` was given.
+    // Caller-sized like the regions, and exceeded for the same kind of reason.
+    TextCapacityExceeded,
+
+    // The same for the edit queue, which is sized in operations where the
+    // buffer beside it is sized in bytes.
+    EditCapacityExceeded,
+
     StaleToken,
 
     // An identity that this frame did not register. It is what a caller sees
@@ -188,6 +294,22 @@ pub const Context = struct {
     interactions: []Interaction,
     lookup: []LookupSlot,
 
+    // What one frame did to the focused region, in order, and the bytes the
+    // insertions among them point into. Both may be empty, which is what a UI
+    // with no text target needs and costs it nothing.
+    edits: []Edit,
+    edit_count: usize = 0,
+    text_buffer: []u8,
+    text_len: usize = 0,
+
+    // Which region the queue above is for.
+    //
+    // Focus moves inside a frame: a click or a tab is an event like any other
+    // and what follows it belongs to whatever it focused. Without this the
+    // frame's editing would be handed whole to whichever widget held the
+    // keyboard when the frame ended.
+    edit_owner: ?Id = null,
+
     region_count: usize = 0,
     epoch: u32 = 0,
     phase: Phase = .idle,
@@ -206,10 +328,20 @@ pub const Context = struct {
     // is under three slots. It also makes exhaustion impossible: a free slot
     // exists whenever a region does, which is what lets `findInsertionSlot`
     // carry no failure path.
+    // The two editing arrays are the ones with no size requirement, because
+    // there is a UI that wants neither: nothing is queued until something is
+    // focusable and reads it, and an empty slice refuses the first operation
+    // that arrives, which is the truth about a UI with no field in it.
+    //
+    // Sized independently, because they measure different things. The queue is
+    // in operations and the buffer is in bytes, and a frame that inserts one
+    // character six times fills one of them six times faster than the other.
     pub fn initBuffers(
         regions: []Region,
         interactions: []Interaction,
         lookup: []LookupSlot,
+        edits: []Edit,
+        text_buffer: []u8,
     ) Error!Context {
         if (regions.len == 0) return error.EmptyStorage;
         if (interactions.len < regions.len or lookup.len < regions.len * 2)
@@ -222,7 +354,13 @@ pub const Context = struct {
         // is emptied here rather than by asking the caller to have done it.
         for (lookup) |*slot| slot.* = .{};
 
-        return .{ .regions = regions, .interactions = interactions, .lookup = lookup };
+        return .{
+            .regions = regions,
+            .interactions = interactions,
+            .lookup = lookup,
+            .edits = edits,
+            .text_buffer = text_buffer,
+        };
     }
 
     // Opens registration. Refused from inside a frame, because dropping the
@@ -234,6 +372,11 @@ pub const Context = struct {
 
         self.region_count = 0;
         self.hot = null;
+        // The editing is a frame's, like the regions it was routed against.
+        // What a widget does with it, it did on the frame it arrived.
+        self.edit_count = 0;
+        self.text_len = 0;
+        self.edit_owner = null;
         self.epoch +%= 1;
         if (self.epoch == 0) {
             // Wrapped, so slots left over from the epoch that is about to be
@@ -321,7 +464,9 @@ pub const Context = struct {
                 break :blk self.hot != null or self.capture != null;
             },
             .pointer_button => |button_event| try self.routeButton(button_event),
-            .key => |key_event| self.routeKey(key_event),
+            .key => |key_event| try self.routeKey(key_event),
+            .text => |bytes| try self.routeText(bytes),
+            .scroll => |delta| try self.routeScroll(delta),
             .focus => |focused| blk: {
                 self.window_focused = focused;
                 if (!focused) self.endGesture();
@@ -371,6 +516,22 @@ pub const Context = struct {
         return self.interactions[token.index];
     }
 
+    // What this frame did to the region named by `region_id`, in order, and an
+    // empty slice for every other region.
+    //
+    // Read in the drawing pass, because that is when a widget exists to act on
+    // it. The entries live in the caller's arrays and are valid until the next
+    // `beginFrame`.
+    //
+    // Asked for by identity and not answered for whatever holds the keyboard,
+    // so that a widget cannot be handed editing the frame routed to somebody
+    // else. That is not hypothetical: focus moves inside a frame.
+    pub fn editsForId(self: *const Context, region_id: Id) Error![]const Edit {
+        if (self.phase != .routed) return error.InvalidPhase;
+        if (self.edit_owner != region_id) return &.{};
+        return self.edits[0..self.edit_count];
+    }
+
     // The same, by identity rather than by handle.
     //
     // A caller that registers its regions through a façade does not hold the
@@ -395,6 +556,12 @@ pub const Context = struct {
         self.hot = null;
         self.capture = null;
         self.focused = null;
+        // The editing goes with the rest. It was routed to a widget that is
+        // about to lose the keyboard, and leaving it would insert a character
+        // the cancel says not to act on.
+        self.edit_count = 0;
+        self.text_len = 0;
+        self.edit_owner = null;
         for (self.interactions[0..self.region_count]) |*state| state.* = .{};
     }
 
@@ -447,6 +614,103 @@ pub const Context = struct {
         };
     }
 
+    // Queues committed text for whatever holds the keyboard.
+    //
+    // A chunk is taken whole or not at all. That is what keeps the buffer on a
+    // character boundary: taking the part of a chunk that fits would leave a
+    // UTF-8 sequence cut in half, which every reader downstream would then have
+    // to handle.
+    fn routeText(self: *Context, bytes: []const u8) Error!bool {
+        // Text with nothing to type into is not the UI's. A host that binds a
+        // character to something of its own keeps that binding until a field
+        // has the keyboard.
+        if (self.editTarget() == null) return false;
+
+        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidText;
+
+        // Written as the room left rather than as a sum, which cannot overflow.
+        // `text_len` never passes `text_buffer.len`, so the subtraction is
+        // sound for the same reason the copy below is in range.
+        if (bytes.len > self.text_buffer.len - self.text_len)
+            return error.TextCapacityExceeded;
+        // Reserved before the bytes are copied, so a queue that is full leaves
+        // the buffer as it was rather than holding text no entry names.
+        const slot = try self.reserveEdit();
+
+        const written = self.text_buffer[self.text_len..][0..bytes.len];
+        @memcpy(written, bytes);
+        self.text_len += bytes.len;
+        slot.* = .{ .insert = written };
+        return true;
+    }
+
+    // Queues one motion or editing key for whatever holds the keyboard.
+    fn routeEditKey(self: *Context, event: KeyEvent) Error!bool {
+        if (self.editTarget() == null) return false;
+        // The release is not an operation. The press and every repeat under it
+        // are, which is what makes a held arrow travel.
+        if (event.action == .release) return true;
+
+        const slot = try self.reserveEdit();
+        slot.* = .{ .key = .{
+            .key = event.key,
+            .shift = event.shift,
+            .control = event.control,
+        } };
+        return true;
+    }
+
+    // The region an edit belongs to, or nothing when the keyboard is not on a
+    // region that can take one.
+    //
+    // Clearing the queue on a change of owner is here rather than at each
+    // caller: focus moves inside a frame, and what was queued before the move
+    // belongs to a widget that will not be asked for it. Dropping it is the
+    // only answer that does not hand one widget's typing to another.
+    fn editTarget(self: *Context) ?Id {
+        if (!self.window_focused) return null;
+        const index = self.focusedIndex() orelse return null;
+        const owner = self.regions[index].id;
+        if (self.edit_owner != owner) {
+            self.edit_count = 0;
+            self.text_len = 0;
+            self.edit_owner = owner;
+        }
+        return owner;
+    }
+
+    fn reserveEdit(self: *Context) Error!*Edit {
+        if (self.edit_count == self.edits.len) return error.EditCapacityExceeded;
+        const slot = &self.edits[self.edit_count];
+        self.edit_count += 1;
+        return slot;
+    }
+
+    // Adds a wheel turn to the innermost scrolling region under the pointer.
+    //
+    // Not to the hot region. The pointer resolves to the topmost widget it is
+    // over, which for a wheel is usually the wrong one: a slider inside a list
+    // is what the pointer is on and the list is what the wheel is for.
+    fn routeScroll(self: *Context, delta: Point) Error!bool {
+        if (!std.math.isFinite(delta.x) or !std.math.isFinite(delta.y))
+            return error.InvalidScrollDelta;
+        if (!self.window_focused) return false;
+
+        // One gesture at a time, as for a second button pressed during a drag.
+        // The wheel is the UI's for as long as the UI holds the pointer, and
+        // it moves nothing while a drag is in progress.
+        if (self.capture != null) return true;
+
+        const point = self.pointer orelse return false;
+        const target = hit_test.hitTestScrollable(self.regions[0..self.region_count], point) orelse
+            return false;
+        if (self.find(target)) |index| {
+            self.interactions[index].scroll.x += delta.x;
+            self.interactions[index].scroll.y += delta.y;
+        }
+        return true;
+    }
+
     // A position that is not finite is refused and changes nothing.
     //
     // The gesture is deliberately left alone. Ending it would let one bad
@@ -459,8 +723,14 @@ pub const Context = struct {
         self.updateHot();
     }
 
-    fn routeKey(self: *Context, event: KeyEvent) bool {
+    fn routeKey(self: *Context, event: KeyEvent) Error!bool {
         if (!self.window_focused) return false;
+
+        // Queued first and in every case, whatever else the key also does
+        // here. Left and right are both: a field reads them off the queue in
+        // the order they arrived, and a slider reads their sum off `adjust`.
+        // The two answer different questions about the same keystroke.
+        const queued = if (isEditKey(event.key)) try self.routeEditKey(event) else false;
 
         return switch (event.key) {
             .tab => blk: {
@@ -492,6 +762,11 @@ pub const Context = struct {
                 }
                 break :blk true;
             },
+            // Consumed whenever something holds the keyboard, whether or not
+            // that widget edits text. A host that acted on a backspace because
+            // the focused widget happened to ignore it would be acting on a
+            // keystroke the UI took.
+            .backspace, .delete, .home, .end => queued,
         };
     }
 

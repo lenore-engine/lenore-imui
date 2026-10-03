@@ -553,3 +553,113 @@ test "a failure part way through placement still leaves the results alone" {
     try expectRect(kept_first, fixture.results[1]);
     try expectRect(kept_second, fixture.results[2]);
 }
+
+// The authoring literal
+//
+// A row of three fixed panels under a root that fills the window, which is the
+// smallest tree that says something about order and about naming at once.
+const Bar = imui.Layout.define(imui.Layout.branch(.{
+    .arrangement = .row,
+    .cross_alignment = .stretch,
+}, .{
+    .left = imui.Layout.leaf(.{ .width = .{ .fixed = 10 } }),
+    .middle = imui.Layout.leaf(.{ .width = .{ .fixed = 20 } }),
+    .right = imui.Layout.leaf(.{ .flex_grow = 1 }),
+}));
+
+test "a literal flattens into the tree the solver takes" {
+    var fixture: Fixture = .{};
+    var bar = Bar{};
+    try bar.solveLayout(root_rect, fixture.workspace());
+
+    // Four nodes: the root and its three children, and three edges.
+    try testing.expectEqual(@as(usize, 4), Bar.node_count);
+    try testing.expectEqual(@as(usize, 3), Bar.edges.len);
+    try testing.expectEqual(root_rect, bar.rect(.root));
+}
+
+test "children are laid out in the order they were written" {
+    var fixture: Fixture = .{};
+    var bar = Bar{};
+    try bar.solveLayout(root_rect, fixture.workspace());
+
+    // Ten, then twenty, then whatever is left. Nothing but the order of the
+    // fields decides which panel is which, so this is what pins that the
+    // literal reads left to right.
+    try testing.expectEqual(@as(f32, 0), bar.rect(.left).x);
+    try testing.expectEqual(@as(f32, 10), bar.rect(.left).width);
+    try testing.expectEqual(@as(f32, 10), bar.rect(.middle).x);
+    try testing.expectEqual(@as(f32, 20), bar.rect(.middle).width);
+    try testing.expectEqual(@as(f32, 30), bar.rect(.right).x);
+    try testing.expectEqual(@as(f32, 70), bar.rect(.right).width);
+
+    // The cross axis stretches, which is what the root asked for.
+    try testing.expectEqual(@as(f32, 60), bar.rect(.middle).height);
+}
+
+test "a node changed between solves moves what depends on it" {
+    var fixture: Fixture = .{};
+    var bar = Bar{};
+
+    bar.node(.left).width = .{ .fixed = 40 };
+    try bar.solveLayout(root_rect, fixture.workspace());
+    try testing.expectEqual(@as(f32, 40), bar.rect(.left).width);
+    try testing.expectEqual(@as(f32, 40), bar.rect(.middle).x);
+    // The growing panel absorbs the difference rather than the row overflowing.
+    try testing.expectEqual(@as(f32, 40), bar.rect(.right).width);
+}
+
+// Nesting, so that a branch inside a branch is walked parents-first and its
+// own children are numbered after it rather than after its siblings.
+const Frame = imui.Layout.define(imui.Layout.branch(.{
+    .arrangement = .column,
+    .cross_alignment = .stretch,
+}, .{
+    .header = imui.Layout.leaf(.{ .height = .{ .fixed = 10 } }),
+    .body = imui.Layout.branch(.{
+        .arrangement = .row,
+        .flex_grow = 1,
+        .cross_alignment = .stretch,
+    }, .{
+        .viewport = imui.Layout.leaf(.{ .flex_grow = 1 }),
+        .dock = imui.Layout.leaf(.{ .width = .{ .fixed = 25 } }),
+    }),
+    .status = imui.Layout.leaf(.{ .height = .{ .fixed = 8 } }),
+}));
+
+test "a branch inside a branch keeps its own children" {
+    var fixture: Fixture = .{};
+    var frame = Frame{};
+    try frame.solveLayout(root_rect, fixture.workspace());
+
+    try testing.expectEqual(@as(usize, 6), Frame.node_count);
+    try testing.expectEqual(@as(f32, 10), frame.rect(.body).y);
+    try testing.expectEqual(@as(f32, 42), frame.rect(.body).height);
+
+    // The dock is on the right of the body and the viewport takes the rest, so
+    // the two tile it exactly.
+    try testing.expectEqual(@as(f32, 75), frame.rect(.dock).x);
+    try testing.expectEqual(@as(f32, 25), frame.rect(.dock).width);
+    try testing.expectEqual(@as(f32, 0), frame.rect(.viewport).x);
+    try testing.expectEqual(@as(f32, 75), frame.rect(.viewport).width);
+    // And they sit inside the body rather than inside the window.
+    try testing.expectEqual(frame.rect(.body).y, frame.rect(.dock).y);
+
+    try testing.expectEqual(@as(f32, 52), frame.rect(.status).y);
+}
+
+test "a tree that fails to solve leaves the last answer alone" {
+    var fixture: Fixture = .{};
+    var frame = Frame{};
+    try frame.solveLayout(root_rect, fixture.workspace());
+    const settled = frame.rect(.dock);
+
+    // A width that is not finite is refused by the solver's own validation,
+    // and the rectangles it refused to compute are the ones already there.
+    frame.node(.dock).width = .{ .fixed = std.math.nan(f32) };
+    try testing.expectError(
+        error.InvalidNodeData,
+        frame.solveLayout(root_rect, fixture.workspace()),
+    );
+    try testing.expectEqual(settled, frame.rect(.dock));
+}

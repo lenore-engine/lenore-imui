@@ -8,6 +8,7 @@ const Id = imui.Id;
 const Point = imui.Point;
 const Region = imui.Region;
 const hitTest = imui.hitTest;
+const hitTestScrollable = imui.hitTestScrollable;
 
 const nowhere: res.Rect = .{ .x = -1000, .y = -1000, .width = 4000, .height = 4000 };
 
@@ -71,6 +72,55 @@ test "ill-formed geometry is hit by nothing rather than by everything" {
     // And a position that is not finite falls on no well-formed region either.
     const sound = [_]Region{region(4, .{ .x = 0, .y = 0, .width = 10, .height = 10 })};
     try testing.expectEqual(null, hitTest(&sound, .{ .x = nan, .y = 5 }));
+}
+
+// The case the flag exists for. A widget that does not scroll sits over one
+// that does, the pointer is on the widget, and the wheel belongs to the region
+// beneath it. Nothing in the pointer's own answer changes.
+test "the wheel reaches past a region that does not scroll" {
+    const rect: res.Rect = .{ .x = 0, .y = 0, .width = 100, .height = 100 };
+    var regions = [_]Region{
+        region(1, rect),
+        region(2, .{ .x = 10, .y = 10, .width = 20, .height = 20 }),
+    };
+    regions[0].scrollable = true;
+
+    const inside: Point = .{ .x = 15, .y = 15 };
+    try testing.expectEqual(id(2), hitTest(&regions, inside));
+    try testing.expectEqual(id(1), hitTestScrollable(&regions, inside));
+}
+
+// Painter's order is the whole of the nesting rule, so an inner list needs no
+// notion of a parent to win over the one it sits in.
+test "the innermost scrolling region is the one that answers" {
+    var regions = [_]Region{
+        region(1, .{ .x = 0, .y = 0, .width = 100, .height = 100 }),
+        region(2, .{ .x = 10, .y = 10, .width = 40, .height = 40 }),
+    };
+    regions[0].scrollable = true;
+    regions[1].scrollable = true;
+
+    try testing.expectEqual(id(2), hitTestScrollable(&regions, .{ .x = 20, .y = 20 }));
+    // Outside the inner one, still inside the outer.
+    try testing.expectEqual(id(1), hitTestScrollable(&regions, .{ .x = 70, .y = 70 }));
+}
+
+test "a frame with nothing to scroll answers nothing" {
+    const regions = [_]Region{region(1, .{ .x = 0, .y = 0, .width = 10, .height = 10 })};
+    // The position is on a region, which is what makes this the interesting
+    // answer: a host reads it to decide whether the wheel was the UI's.
+    try testing.expectEqual(id(1), hitTest(&regions, .{ .x = 5, .y = 5 }));
+    try testing.expectEqual(null, hitTestScrollable(&regions, .{ .x = 5, .y = 5 }));
+}
+
+test "a disabled region does not scroll either" {
+    const rect: res.Rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 };
+    var regions = [_]Region{ region(1, rect), region(2, rect) };
+    regions[0].scrollable = true;
+    regions[1].scrollable = true;
+    regions[1].enabled = false;
+
+    try testing.expectEqual(id(1), hitTestScrollable(&regions, .{ .x = 5, .y = 5 }));
 }
 
 test "adjacent regions share no position" {

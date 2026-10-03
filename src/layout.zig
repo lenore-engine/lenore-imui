@@ -603,3 +603,194 @@ fn multiply(a: f32, b: f32) Error!f32 {
     if (!std.math.isFinite(result)) return error.ArithmeticOverflow;
     return result;
 }
+
+// Authoring a tree as a nested literal, flattened at comptime into the arrays
+// the solver above takes.
+//
+// The solver's own form is two flat arrays and a range per node, which is what
+// makes it a pair of straight walks. It is not a form anybody wants to write:
+// a panel moved from one parent to another means renumbering every edge after
+// it, and nothing checks that the numbers still describe a tree until the solve
+// refuses them. What is written here instead is the shape, with the parents
+// containing their children, and the numbering is derived.
+//
+// The names come out as an enum, so `rect(.viewport)` is a compile error when
+// the node is renamed and an index into an array afterwards. That is the whole
+// reason this is worth a comptime pass: the alternative is a `const viewport =
+// 4;` beside every layout, which is the numbering problem again with a nicer
+// spelling.
+//
+// Fields are read through `@typeInfo` rather than through `std.meta.fields`,
+// which neither the pinned toolchain nor master has.
+
+pub fn Branch(comptime Children: type) type {
+    return struct {
+        node: Node,
+        children: Children,
+    };
+}
+
+// A node with children under it. The child range is derived by `define`, so
+// whatever the caller put in those two fields is dropped here rather than
+// silently used.
+pub fn branch(comptime node_spec: Node, comptime children: anytype) Branch(@TypeOf(children)) {
+    var normalized = node_spec;
+    normalized.child_start = 0;
+    normalized.child_count = 0;
+    return .{ .node = normalized, .children = children };
+}
+
+const NoChildren = struct {};
+
+pub fn leaf(comptime node_spec: Node) Branch(NoChildren) {
+    var normalized = node_spec;
+    normalized.child_start = 0;
+    normalized.child_count = 0;
+    return .{ .node = normalized, .children = .{} };
+}
+
+// Turns a literal built from `branch` and `leaf` into a type holding one
+// solvable tree.
+//
+// The nodes are a field and the edges are a declaration, because the two differ
+// in what a caller may do to them: a width is changed between frames and a
+// parent is not. A tree whose edges could be assigned would be a tree that
+// stops being the one this checked at comptime.
+pub fn define(comptime root_spec: anytype) type {
+    comptime validateSpec(root_spec, "root");
+    const total = comptime countSpecNodes(root_spec);
+    if (total > no_parent) @compileError("layout literal has too many nodes");
+
+    // The default quota is a thousand backwards branches, which a tree of a
+    // dozen nodes fits and one of thirty does not.
+    //
+    // The work below is quadratic in the nodes and nothing else: the duplicate
+    // name check compares every name against every earlier one, which is
+    // `total * total / 2` string comparisons, and a comparison of short names
+    // costs a few dozen branches. Thirty-two per pair is what that comes to
+    // with room over, and the linear passes beside it disappear against the
+    // square. It bounds comptime work and costs a running program nothing.
+    @setEvalBranchQuota(1000 + total * total * 32);
+
+    const Flat = struct {
+        nodes: [total]Node,
+        edges: [total - 1]NodeIndex,
+        names: [total][]const u8,
+    };
+    const flat = comptime blk: {
+        var result: Flat = undefined;
+        var node_cursor: usize = 0;
+        var edge_cursor: usize = 0;
+        flattenSpec(root_spec, "root", &result, &node_cursor, &edge_cursor);
+        // A rooted tree of n nodes has n - 1 edges, and the walk visits each
+        // node once. Either count coming out wrong means the flattening and the
+        // counting disagree, which is this file's own mistake rather than the
+        // caller's.
+        if (node_cursor != total or edge_cursor != total - 1)
+            @compileError("layout flattening disagreed with its own count");
+        for (result.names, 0..) |name, index| {
+            for (result.names[0..index]) |earlier| {
+                if (std.mem.eql(u8, name, earlier))
+                    @compileError("two layout nodes are named '" ++ name ++ "'");
+            }
+        }
+        break :blk result;
+    };
+    const values = comptime blk: {
+        var result: [total]NodeIndex = undefined;
+        for (&result, 0..) |*value, index| value.* = @intCast(index);
+        break :blk result;
+    };
+
+    return struct {
+        const Self = @This();
+
+        pub const Name = @Enum(NodeIndex, .exhaustive, &flat.names, &values);
+        pub const node_count = total;
+        pub const edges = flat.edges;
+
+        // Mutable, because a layout that could not be changed between frames
+        // would need a second tree per state a panel can be in.
+        nodes: [total]Node = flat.nodes,
+
+        // The last solve's answer. Untouched by a solve that failed, which is
+        // what the solver promises and what lets a frame draw the previous
+        // geometry rather than half of a new one.
+        rects: [total]LogicalRect = @splat(.{ .x = 0, .y = 0, .width = 0, .height = 0 }),
+
+        pub fn tree(self: *const Self) Tree {
+            return .{ .nodes = &self.nodes, .children = &edges };
+        }
+
+        pub fn node(self: *Self, name: Name) *Node {
+            return &self.nodes[@intFromEnum(name)];
+        }
+
+        pub fn rect(self: *const Self, name: Name) LogicalRect {
+            return self.rects[@intFromEnum(name)];
+        }
+
+        pub fn solveLayout(self: *Self, root_rect: LogicalRect, workspace: Workspace) Error!void {
+            return solve(self.tree(), root_rect, workspace, &self.rects);
+        }
+    };
+}
+
+fn validateSpec(comptime spec: anytype, comptime name: []const u8) void {
+    const Spec = @TypeOf(spec);
+    const info = @typeInfo(Spec);
+    if (info != .@"struct" or !@hasField(Spec, "node") or !@hasField(Spec, "children"))
+        @compileError("layout node '" ++ name ++ "' was not built by branch or leaf");
+    if (@TypeOf(spec.node) != Node)
+        @compileError("layout node '" ++ name ++ "' does not carry a Node");
+
+    const children = @typeInfo(@TypeOf(spec.children));
+    if (children != .@"struct")
+        @compileError("the children of '" ++ name ++ "' must be a named struct literal");
+    inline for (children.@"struct".fields) |field|
+        validateSpec(@field(spec.children, field.name), field.name);
+}
+
+fn countSpecNodes(comptime spec: anytype) usize {
+    var count: usize = 1;
+    inline for (@typeInfo(@TypeOf(spec.children)).@"struct".fields) |field|
+        count += countSpecNodes(@field(spec.children, field.name));
+    return count;
+}
+
+// Depth first, parents before children, in the order the fields were written.
+//
+// That order is what the solver lays out along the main axis, so the literal
+// reads top to bottom as the panels appear left to right or down the window.
+fn flattenSpec(
+    comptime spec: anytype,
+    comptime name: []const u8,
+    flat: anytype,
+    node_cursor: *usize,
+    edge_cursor: *usize,
+) void {
+    const index = node_cursor.*;
+    node_cursor.* += 1;
+    flat.names[index] = name;
+
+    const fields = @typeInfo(@TypeOf(spec.children)).@"struct".fields;
+    var placed = spec.node;
+    placed.child_start = @intCast(edge_cursor.*);
+    placed.child_count = @intCast(fields.len);
+    flat.nodes[index] = placed;
+
+    // The edges are reserved before the children are walked, because a child
+    // that is itself a branch moves the cursor past them.
+    const first_edge = edge_cursor.*;
+    edge_cursor.* += fields.len;
+    inline for (fields, 0..) |field, offset| {
+        flat.edges[first_edge + offset] = @intCast(node_cursor.*);
+        flattenSpec(
+            @field(spec.children, field.name),
+            field.name,
+            flat,
+            node_cursor,
+            edge_cursor,
+        );
+    }
+}

@@ -29,8 +29,11 @@ pub const IdStackError = id_stack.Error;
 
 pub const Region = hit_test.Region;
 pub const hitTest = hit_test.hitTest;
+pub const hitTestScrollable = hit_test.hitTestScrollable;
 
 pub const ButtonAction = input.ButtonAction;
+pub const Edit = input.Edit;
+pub const EditKey = input.EditKey;
 pub const Event = input.Event;
 pub const InputContext = input.Context;
 pub const InputError = input.Error;
@@ -57,6 +60,16 @@ pub const Padding = layout.Padding;
 pub const Workspace = layout.Workspace;
 pub const solveLayout = layout.solve;
 
+// The authoring side of the solver, as a namespace, because the three names
+// mean nothing apart: `Layout.define` takes what `Layout.branch` and
+// `Layout.leaf` build and nothing else. It re-exports none of the types above,
+// so there is still one spelling of `Arrangement`.
+pub const Layout = struct {
+    pub const define = layout.define;
+    pub const branch = layout.branch;
+    pub const leaf = layout.leaf;
+};
+
 pub const addRoundedRect = primitives.addRoundedRect;
 pub const addGlyphs = text.addGlyphs;
 
@@ -67,13 +80,22 @@ pub const LabelStyle = widgets.LabelStyle;
 pub const SliderRange = widgets.SliderRange;
 pub const SliderStyle = widgets.SliderStyle;
 pub const SplitterStyle = widgets.SplitterStyle;
+pub const TextFieldState = widgets.TextFieldState;
+pub const TextFieldStyle = widgets.TextFieldStyle;
 pub const WidgetError = widgets.Error;
+pub const advanceTo = widgets.advanceTo;
+pub const applyEdits = widgets.applyEdits;
+pub const caretScroll = widgets.caretScroll;
 pub const drawButton = widgets.drawButton;
 pub const drawCheckbox = widgets.drawCheckbox;
 pub const drawLabel = widgets.drawLabel;
 pub const drawSlider = widgets.drawSlider;
 pub const drawSplitter = widgets.drawSplitter;
+pub const drawTextField = widgets.drawTextField;
 pub const labelBaseline = widgets.labelBaseline;
+pub const offsetAt = widgets.offsetAt;
+pub const scrollOffset = widgets.scrollOffset;
+pub const textFieldLine = widgets.textFieldLine;
 pub const sliderFraction = widgets.sliderFraction;
 pub const sliderValue = widgets.sliderValue;
 

@@ -57,6 +57,8 @@ const Fixture = struct {
     interactions: [8]Interaction = undefined,
     lookup: [16]LookupSlot = undefined,
     scopes: [8]imui.Id = undefined,
+    edits: [4]imui.Edit = undefined,
+    text: [8]u8 = undefined,
 
     vertices: [512]Vertex = undefined,
     indices: [1024]Index = undefined,
@@ -71,6 +73,8 @@ const Fixture = struct {
             &self.regions,
             &self.interactions,
             &self.lookup,
+            &self.edits,
+            &self.text,
         );
         self.canvas = try Canvas.init(.{
             .vertices = &self.vertices,
@@ -99,6 +103,8 @@ test "a context needs an image to sample and room for its scopes" {
         &fixture.regions,
         &fixture.interactions,
         &fixture.lookup,
+        &fixture.edits,
+        &fixture.text,
     );
     fixture.canvas = try Canvas.init(.{
         .vertices = &fixture.vertices,
@@ -621,4 +627,184 @@ test "a caption and the widget under it are one call each" {
     // the button just made. That is the cost of text over a fill and it is
     // worth seeing in a test rather than discovering in a frame capture.
     try testing.expectEqual(background + 1, fixture.canvas.commands().len);
+}
+
+// Scrolling and text
+
+const glyph_advance: f32 = 10;
+
+const run_glyphs = [_]res.ShapedGlyph{
+    .{ .index = 1, .cluster = 0, .x_advance = glyph_advance, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
+    .{ .index = 2, .cluster = 1, .x_advance = glyph_advance, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
+    .{ .index = 3, .cluster = 2, .x_advance = glyph_advance, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
+};
+const run_placements = [_]res.GlyphPlacement{
+    .{ .left = 0, .top = 12, .width = 8, .height = 14, .u_min = 0, .v_min = 0, .u_max = 0.1, .v_max = 0.1 },
+} ** 3;
+
+const shaped: imui.Label = .{
+    .run = .{ .glyphs = &run_glyphs, .placements = &run_placements, .buckets = .whole },
+    .metrics = .{ .ascent = 16, .descent = -4, .line_gap = 2 },
+    .advance = glyph_advance * run_glyphs.len,
+    .atlas = image,
+};
+
+const field_style: imui.TextFieldStyle = .{
+    .box = flat,
+    .normal_text = colour(0.1),
+    .disabled_text = colour(0.4),
+    .selection = colour(0.7),
+    .caret = colour(0.8),
+    .caret_width = 1,
+};
+
+const field_key: imui.IdKey = .{ .string = "field" };
+const list_key: imui.IdKey = .{ .string = "list" };
+
+// Runs one frame with a single text field registered over `box`, and leaves the
+// context in the drawing pass for the caller to edit and draw in.
+fn fieldFrame(context: *WidgetContext, events: []const imui.Event) !void {
+    try context.beginFrame(root);
+    try context.register(field_key, box, .{ .focusable = true });
+    try context.beginRouting();
+    for (events) |event| _ = try context.routeEvent(event);
+    try context.finishRouting();
+}
+
+test "a field takes the frame's typing and reports the change" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    var buffer: [32]u8 = undefined;
+    var state: imui.TextFieldState = .{};
+
+    try fieldFrame(&context, &.{
+        press(20, 20),
+        release(20, 20),
+        .{ .text = "ab" },
+    });
+    try testing.expect(try context.editText(field_key, box, field_style, &buffer, &state, shaped, true));
+    try testing.expectEqualStrings("ab", buffer[0..state.len]);
+
+    // A frame that typed nothing changed nothing.
+    try fieldFrame(&context, &.{});
+    try testing.expect(!try context.editText(field_key, box, field_style, &buffer, &state, shaped, true));
+}
+
+test "a click puts the caret where it landed" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    var buffer: [32]u8 = undefined;
+    @memcpy(buffer[0..3], "abc");
+    var state: imui.TextFieldState = .{ .len = 3, .caret = 3, .anchor = 3 };
+
+    // The field starts at x = 10 and each glyph is ten wide, so this is four
+    // into the first character: on its left half, and so before it.
+    try fieldFrame(&context, &.{press(14, 20)});
+    _ = try context.editText(field_key, box, field_style, &buffer, &state, shaped, true);
+    try testing.expectEqual(@as(usize, 0), state.caret);
+    try testing.expect(!state.hasSelection());
+}
+
+test "a drag from a click selects what it crossed" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    var buffer: [32]u8 = undefined;
+    @memcpy(buffer[0..3], "abc");
+    var state: imui.TextFieldState = .{ .len = 3, .caret = 0, .anchor = 0 };
+
+    try fieldFrame(&context, &.{press(14, 20)});
+    _ = try context.editText(field_key, box, field_style, &buffer, &state, shaped, true);
+
+    // The capture is still held, so the caret follows and the anchor does not.
+    try fieldFrame(&context, &.{.{ .pointer_move = at(32, 20) }});
+    _ = try context.editText(field_key, box, field_style, &buffer, &state, shaped, true);
+    try testing.expectEqual(@as(usize, 0), state.anchor);
+    try testing.expectEqual(@as(usize, 2), state.caret);
+}
+
+test "a disabled field is not moved by a click either" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    var buffer: [32]u8 = undefined;
+    @memcpy(buffer[0..3], "abc");
+    var state: imui.TextFieldState = .{ .len = 3, .caret = 3, .anchor = 3 };
+
+    try fieldFrame(&context, &.{press(14, 20)});
+    _ = try context.editText(field_key, box, field_style, &buffer, &state, shaped, false);
+    try testing.expectEqual(@as(usize, 3), state.caret);
+}
+
+test "drawing a field settles its scroll against the run it is about to draw" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    // A field twenty wide over a line of thirty leaves ten of travel, and the
+    // caret at the end is what pulls the line across.
+    const narrow: Rect = .{ .x = 10, .y = 10, .width = 20, .height = 20 };
+    var state: imui.TextFieldState = .{ .len = 3, .caret = 3, .anchor = 3 };
+
+    try context.beginFrame(root);
+    try context.register(field_key, narrow, .{ .focusable = true });
+    try context.beginRouting();
+    try context.finishRouting();
+    try context.textField(field_key, narrow, field_style, &state, shaped, true);
+
+    try testing.expectApproxEqAbs(10, state.scroll, 1e-4);
+}
+
+test "the wheel moves a scrolling region and stops at its ends" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    var offset: f32 = 0;
+
+    try context.beginFrame(root);
+    try context.register(list_key, root, .{ .scrollable = true });
+    try context.beginRouting();
+    _ = try context.routeEvent(.{ .pointer_move = at(20, 20) });
+    _ = try context.routeEvent(.{ .scroll = at(0, 30) });
+    try context.finishRouting();
+
+    try testing.expect(try context.scroll(list_key, 300, 100, &offset));
+    try testing.expectApproxEqAbs(30, offset, 1e-4);
+
+    // A frame with no wheel in it moves nothing and says so.
+    try context.beginFrame(root);
+    try context.register(list_key, root, .{ .scrollable = true });
+    try context.beginRouting();
+    try context.finishRouting();
+    try testing.expect(!try context.scroll(list_key, 300, 100, &offset));
+    try testing.expectApproxEqAbs(30, offset, 1e-4);
+}
+
+test "a region registered without scrollable is not reached by the wheel" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    var offset: f32 = 0;
+
+    try context.beginFrame(root);
+    try context.register(list_key, root, .{});
+    try context.beginRouting();
+    _ = try context.routeEvent(.{ .pointer_move = at(20, 20) });
+    // Not the UI's, because nothing under the pointer scrolls.
+    try testing.expect(!try context.routeEvent(.{ .scroll = at(0, 30) }));
+    try context.finishRouting();
+
+    try testing.expect(!try context.scroll(list_key, 300, 100, &offset));
+    try testing.expectApproxEqAbs(0, offset, 1e-4);
+}
+
+test "editing and drawing a field are refused outside the drawing pass" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    var buffer: [32]u8 = undefined;
+    var state: imui.TextFieldState = .{};
+
+    try testing.expectError(
+        error.InvalidPhase,
+        context.editText(field_key, box, field_style, &buffer, &state, shaped, true),
+    );
+    try context.beginFrame(root);
+    try testing.expectError(
+        error.InvalidPhase,
+        context.textField(field_key, box, field_style, &state, shaped, true),
+    );
 }

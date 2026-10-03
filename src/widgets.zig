@@ -7,6 +7,7 @@ const text = @import("text.zig");
 const types = @import("types.zig");
 
 const Canvas = canvas_mod.Canvas;
+const Edit = input.Edit;
 const FontMetrics = res.FontMetrics;
 const GlyphRun = res.GlyphRun;
 const ImageHandle = res.ImageHandle;
@@ -152,6 +153,15 @@ pub const Error = canvas_mod.Error || error{
     // A range with no interior, or one built from values that are not finite.
     // It comes from application code and is checked once, here.
     InvalidRange,
+
+    // A text field's state does not describe its buffer: a length past the
+    // buffer, a caret past the length, or a caret in the middle of a character.
+    //
+    // Checked because the state is the caller's and every slice below is taken
+    // with it. In a build with the safety checks off a caret past the length is
+    // a read out of bounds rather than a panic, and one inside a character
+    // cuts a UTF-8 sequence in half.
+    InvalidTextState,
 };
 
 // Which fill a button-shaped thing wears.
@@ -455,4 +465,441 @@ fn quantize(value: f32, range: SliderRange) f32 {
     const highest = @floor((range.max - range.min) / range.step);
     const steps = @min(@round((clamped - range.min) / range.step), highest);
     return range.min + steps * range.step;
+}
+
+// Where a scrolling region sits after this frame's wheel.
+//
+// The clamp is the whole of it, and it is here rather than in the region that
+// draws because it is arithmetic: an offset, a distance, and the two sizes that
+// say how far there is to go.
+//
+// Zero is the top and the offset grows downward, which is the sense the `scroll`
+// event carries. Content no larger than the view scrolls nowhere rather than
+// scrolling backwards.
+pub fn scrollOffset(current: f32, delta: f32, content: f32, viewport: f32) Error!f32 {
+    if (!std.math.isFinite(current) or !std.math.isFinite(delta) or
+        !std.math.isFinite(content) or !std.math.isFinite(viewport) or
+        content < 0 or viewport < 0)
+        return error.InvalidRange;
+
+    return std.math.clamp(current + delta, 0, @max(content - viewport, 0));
+}
+
+// A text field's own state, which is everything about it that outlives a frame.
+//
+// The bytes are not here. They are the caller's buffer, as everywhere else in
+// this module, and `len` says how much of it the field is using. Two callers
+// editing the same buffer through two of these is a caller's mistake and not
+// one this can detect.
+pub const TextFieldState = struct {
+    // How many bytes of the buffer hold text.
+    len: usize = 0,
+
+    // The caret, as a byte offset into the first `len` bytes. It sits between
+    // characters, never inside one.
+    caret: usize = 0,
+
+    // Where the selection began. Equal to `caret` when there is no selection,
+    // which is why there is no separate flag: a selection is the interval
+    // between the two and an empty interval is no selection.
+    //
+    // It is the anchor and not the lower bound, so a selection dragged
+    // backwards keeps the end the user started from.
+    anchor: usize = 0,
+
+    // How far the line is scrolled to the left, in pixels, so that the caret
+    // stays inside a field narrower than its text.
+    scroll: f32 = 0,
+
+    // The lower and upper bounds of the selection, in that order.
+    pub fn selection(self: TextFieldState) struct { usize, usize } {
+        return .{ @min(self.caret, self.anchor), @max(self.caret, self.anchor) };
+    }
+
+    pub fn hasSelection(self: TextFieldState) bool {
+        return self.caret != self.anchor;
+    }
+};
+
+// Applies one frame's editing to the caller's buffer, and reports whether the
+// text changed.
+//
+// Changed means the bytes changed. A caret that moved and a selection that grew
+// are not changes to the text, and a caller that saves on every change should
+// not save because an arrow key was pressed.
+//
+// Here rather than with the widget façade for the reason `sliderValue` is: it
+// is the one part of a text field that is arithmetic rather than plumbing, and
+// it takes no canvas, no context and no device.
+//
+// The operations are applied in the order they arrived, which is the whole
+// reason the queue is a queue. Typing, a backspace and more typing inside one
+// frame give a different answer in a different order.
+pub fn applyEdits(
+    buffer: []u8,
+    state: *TextFieldState,
+    edits: []const Edit,
+    enabled: bool,
+) Error!bool {
+    try validateState(buffer, state.*);
+    if (!enabled) return false;
+
+    var changed = false;
+    for (edits) |edit| switch (edit) {
+        .insert => |bytes| changed = insert(buffer, state, bytes) or changed,
+        .key => |stroke| switch (stroke.key) {
+            .left => moveCaret(buffer[0..state.len], state, .backward, stroke),
+            .right => moveCaret(buffer[0..state.len], state, .forward, stroke),
+            .home => placeCaret(state, 0, stroke.shift),
+            .end => placeCaret(state, state.len, stroke.shift),
+            .backspace => changed = deleteAdjacent(buffer, state, .backward, stroke) or changed,
+            .delete => changed = deleteAdjacent(buffer, state, .forward, stroke) or changed,
+            // `input.isEditKey` admits six keys and the six are above. The
+            // others never reach the queue, and a field that received one
+            // would have nothing to do with it either way.
+            .tab, .enter, .space, .escape, .up, .down => {},
+        },
+    };
+    return changed;
+}
+
+// Refuses a state that does not describe this buffer, before anything slices
+// with it.
+fn validateState(buffer: []const u8, state: TextFieldState) Error!void {
+    if (state.len > buffer.len) return error.InvalidTextState;
+    if (state.caret > state.len or state.anchor > state.len) return error.InvalidTextState;
+    if (!std.math.isFinite(state.scroll)) return error.InvalidTextState;
+
+    // On a character boundary, which is what every slice below assumes. A
+    // continuation byte is 0b10xxxxxx and no character starts with one.
+    //
+    // Against the text and not the whole buffer, so that a caret at the end
+    // reads no byte at all. The buffer past `len` holds whatever it held
+    // before, and a caret was refused by whatever that byte happened to be.
+    const text_bytes = buffer[0..state.len];
+    if (isContinuation(text_bytes, state.caret) or isContinuation(text_bytes, state.anchor))
+        return error.InvalidTextState;
+}
+
+fn isContinuation(buffer: []const u8, offset: usize) bool {
+    return offset < buffer.len and buffer[offset] & 0xC0 == 0x80;
+}
+
+const Direction = enum { backward, forward };
+
+// Replaces the selection with `bytes`, or inserts them at the caret when there
+// is none.
+//
+// A chunk that does not fit is dropped whole rather than in part. A field with
+// a full buffer stops accepting text, which is what a bounded field does; the
+// alternative of taking the bytes that fit would cut a UTF-8 sequence in half.
+fn insert(buffer: []u8, state: *TextFieldState, bytes: []const u8) bool {
+    const start, const end = state.selection();
+    const remaining = state.len - (end - start);
+    if (bytes.len > buffer.len - remaining) return false;
+    if (bytes.len == 0 and start == end) return false;
+
+    // The tail moves first, because the gap it moves into is the one the
+    // insertion is about to fill.
+    const tail = state.len - end;
+    @memmove(buffer[start + bytes.len ..][0..tail], buffer[end..][0..tail]);
+    @memcpy(buffer[start..][0..bytes.len], bytes);
+
+    state.len = remaining + bytes.len;
+    state.caret = start + bytes.len;
+    state.anchor = state.caret;
+    return true;
+}
+
+// Backspace and delete: the selection if there is one, otherwise the character
+// or word to one side of the caret.
+fn deleteAdjacent(
+    buffer: []u8,
+    state: *TextFieldState,
+    direction: Direction,
+    stroke: input.EditKey,
+) bool {
+    const text_bytes = buffer[0..state.len];
+    var start, var end = state.selection();
+    if (start == end) {
+        // Nothing to either side of an empty selection at the edge, and
+        // reporting a change for a keystroke that removed nothing would make a
+        // caller save a file that did not move.
+        if (direction == .backward) {
+            start = step(text_bytes, start, .backward, stroke.control);
+        } else {
+            end = step(text_bytes, end, .forward, stroke.control);
+        }
+        if (start == end) return false;
+    }
+
+    const tail = state.len - end;
+    @memmove(buffer[start..][0..tail], buffer[end..][0..tail]);
+    state.len -= end - start;
+    state.caret = start;
+    state.anchor = start;
+    return true;
+}
+
+// Left and right, with shift extending the selection and control moving by a
+// word.
+//
+// Without shift, a motion over a selection collapses it to the edge it moved
+// towards rather than moving from the caret. That is what makes right-arrow
+// after selecting a word land at the end of the word instead of one character
+// into it.
+fn moveCaret(
+    text_bytes: []const u8,
+    state: *TextFieldState,
+    direction: Direction,
+    stroke: input.EditKey,
+) void {
+    if (!stroke.shift and state.hasSelection() and !stroke.control) {
+        const start, const end = state.selection();
+        placeCaret(state, if (direction == .backward) start else end, false);
+        return;
+    }
+    placeCaret(state, step(text_bytes, state.caret, direction, stroke.control), stroke.shift);
+}
+
+// Moves the caret, and either drags the anchor with it or leaves it where a
+// selection can grow from.
+fn placeCaret(state: *TextFieldState, offset: usize, extend: bool) void {
+    state.caret = offset;
+    if (!extend) state.anchor = offset;
+}
+
+fn step(text_bytes: []const u8, offset: usize, direction: Direction, by_word: bool) usize {
+    return switch (direction) {
+        .backward => if (by_word) wordLeft(text_bytes, offset) else charLeft(text_bytes, offset),
+        .forward => if (by_word) wordRight(text_bytes, offset) else charRight(text_bytes, offset),
+    };
+}
+
+// The four below are total on any byte slice and never leave it, so a buffer
+// holding something that is not UTF-8 moves the caret oddly rather than out of
+// bounds. That matters with the safety checks off, where a slice past the end
+// is a read of whatever is there.
+
+fn charLeft(text_bytes: []const u8, offset: usize) usize {
+    var index = @min(offset, text_bytes.len);
+    while (index > 0) {
+        index -= 1;
+        if (text_bytes[index] & 0xC0 != 0x80) break;
+    }
+    return index;
+}
+
+fn charRight(text_bytes: []const u8, offset: usize) usize {
+    if (offset >= text_bytes.len) return text_bytes.len;
+    var index = offset + 1;
+    while (index < text_bytes.len and text_bytes[index] & 0xC0 == 0x80) index += 1;
+    return index;
+}
+
+// A word is a run of anything that is not ASCII whitespace, and moving over one
+// takes the whitespace beside it as well.
+//
+// Every byte of a character outside ASCII has its high bit set, so none of them
+// is whitespace and a word runs straight through them. That is also what keeps
+// these two on character boundaries without testing for one: a stop happens
+// only where a whitespace byte meets a word byte, and an ASCII whitespace byte
+// is a whole character.
+//
+// It is a separator rule and not a script-aware one. Word breaking in the sense
+// of Unicode Standard Annex #29 needs the character properties, which is a
+// table this module does not carry.
+fn wordLeft(text_bytes: []const u8, offset: usize) usize {
+    var index = @min(offset, text_bytes.len);
+    while (index > 0 and std.ascii.isWhitespace(text_bytes[index - 1])) index -= 1;
+    while (index > 0 and !std.ascii.isWhitespace(text_bytes[index - 1])) index -= 1;
+    return index;
+}
+
+fn wordRight(text_bytes: []const u8, offset: usize) usize {
+    var index = @min(offset, text_bytes.len);
+    while (index < text_bytes.len and !std.ascii.isWhitespace(text_bytes[index])) index += 1;
+    while (index < text_bytes.len and std.ascii.isWhitespace(text_bytes[index])) index += 1;
+    return index;
+}
+
+// How far the pen has moved by the byte at `offset` in the text the run was
+// shaped from.
+//
+// This measures, where the rest of the file does not, and the reason the rule
+// bends here is that the number depends on the caret. A shaper can sum a run
+// once and hand the total over as `Label.advance`; it cannot sum it up to a
+// position it does not know.
+//
+// `cluster` is the byte the glyph came from, so a character that shaped into
+// several glyphs is passed over as one and a caret can never land inside it.
+//
+// Left to right, which is the direction the pen moves in a run this module can
+// draw. A run that reordered its glyphs would need its own answer, and nothing
+// in this project reorders one yet.
+pub fn advanceTo(run: GlyphRun, offset: usize) f32 {
+    var pen: f32 = 0;
+    for (run.glyphs) |glyph| {
+        if (glyph.cluster >= offset) break;
+        pen += glyph.x_advance;
+    }
+    return pen;
+}
+
+// Where the line has to sit for the caret to be inside the field.
+//
+// Called with the caret's own offset rather than with a direction, so that it
+// answers the same whether the caret arrived by a keystroke, by a click or by
+// the text under it changing length.
+//
+// A line that fits is never scrolled, and no line is ever scrolled past its
+// end: both fall out of the clamp, which is why there is one and not a branch
+// for each case.
+pub fn caretScroll(current: f32, caret: f32, viewport: f32, content: f32) f32 {
+    const travel = @max(content - viewport, 0);
+    var next = std.math.clamp(current, 0, travel);
+    if (caret < next) next = caret;
+    if (caret > next + viewport) next = caret - viewport;
+    return std.math.clamp(next, 0, travel);
+}
+
+// Where a field's line lives: its rectangle less the padding at both ends.
+//
+// Shared by the drawing and by whoever turns a pointer position into a caret,
+// so that the caret a click puts down is under the pointer. Two copies of this
+// arithmetic is one formula kept true in two places, and the one that drifts
+// is the one nothing draws.
+//
+// The padding stops where the two sides would cross, the way a border width
+// does, so an absurd padding empties the line rather than inverting it.
+pub fn textFieldLine(rect: Rect, style: TextFieldStyle) Rect {
+    const inset = @min(style.padding, rect.width * 0.5);
+    return .{
+        .x = rect.x + inset,
+        .y = rect.y,
+        .width = @max(rect.width - inset * 2, 0),
+        .height = rect.height,
+    };
+}
+
+pub const TextFieldStyle = struct {
+    box: ButtonStyle,
+    normal_text: PremultipliedColor,
+    disabled_text: PremultipliedColor,
+
+    // Behind the selected characters, drawn under them.
+    selection: PremultipliedColor,
+    caret: PremultipliedColor,
+    caret_width: f32 = 1,
+
+    // Between the border and the text, at both ends. It is also what the caret
+    // has to sit inside at either extreme, which is why a field with none has
+    // its caret on the border.
+    padding: f32 = 0,
+};
+
+// A single line of editable text.
+//
+// The line is set from the left and centred across the field. There is no
+// alignment to choose: a field whose text is centred moves under the caret as
+// it is typed into, which is why no interface has one.
+//
+// **The caret does not blink.** Blinking is a redraw twice a second for as long
+// as a field holds focus, which is a frame this engine would otherwise not
+// draw, and it buys nothing a steady caret does not already say.
+//
+// The text is clipped to the field, unlike a label. That is what the scroll
+// offset is for, and a field whose text ran past its own border would make the
+// offset pointless.
+pub fn drawTextField(
+    canvas: *Canvas,
+    rect: Rect,
+    style: TextFieldStyle,
+    state: TextFieldState,
+    label: Label,
+    interaction: Interaction,
+    enabled: bool,
+    image: ImageHandle,
+) Error!void {
+    if (!rect.isValid()) return error.InvalidGeometry;
+    if (!std.math.isFinite(style.padding) or style.padding < 0 or
+        !std.math.isFinite(style.caret_width) or style.caret_width < 0 or
+        !std.math.isFinite(state.scroll))
+        return error.InvalidGeometry;
+
+    const mark = canvas.checkpoint();
+    errdefer canvas.restore(mark);
+
+    try drawButton(canvas, rect, style.box, interaction, enabled, image);
+
+    const inner = textFieldLine(rect, style);
+    if (inner.isEmpty()) return;
+
+    try canvas.pushClip(inner);
+    defer canvas.popClip();
+
+    const line: LabelStyle = .{
+        .normal_text = style.normal_text,
+        .disabled_text = style.disabled_text,
+        .horizontal = .start,
+    };
+    var pen = labelBaseline(inner, line, label);
+    pen.x -= state.scroll;
+
+    const start, const end = state.selection();
+    if (start != end) {
+        const from = pen.x + advanceTo(label.run, start);
+        const to = pen.x + advanceTo(label.run, end);
+        // The line's own box, which is the box `labelBaseline` placed the pen
+        // in, so the highlight covers the characters rather than the leading
+        // around them.
+        try canvas.addQuad(.{
+            .x = from,
+            .y = pen.y - label.metrics.ascent,
+            .width = to - from,
+            .height = label.height(),
+        }, .{}, style.selection, image);
+    }
+
+    try text.addGlyphs(
+        canvas,
+        label.run,
+        pen,
+        if (enabled) style.normal_text else style.disabled_text,
+        label.atlas,
+    );
+
+    // Drawn only where the field holds the keyboard: a caret in a field that
+    // is not focused says the typing would land there, and it would not.
+    if (!enabled or !interaction.focused or style.caret_width == 0) return;
+    try canvas.addQuad(.{
+        .x = pen.x + advanceTo(label.run, state.caret),
+        .y = pen.y - label.metrics.ascent,
+        .width = style.caret_width,
+        .height = label.height(),
+    }, .{}, style.caret, image);
+}
+
+// The byte offset a position along the line falls on, for turning a click into
+// a caret.
+//
+// The inverse of `advanceTo`, and `x` is measured from the same origin: the pen
+// the run was drawn from, so a caller scrolled along the line adds its offset
+// back before asking.
+//
+// Half way through a character is where the answer changes, which is what puts
+// the caret on the side of the character the user aimed at rather than always
+// before it.
+//
+// A character that shaped into several glyphs is entered at its own start, and
+// a position inside it answers with that start. There is no byte between the
+// glyphs of one cluster for the answer to be, which is the same reason a caret
+// cannot be moved into one.
+pub fn offsetAt(run: GlyphRun, text_len: usize, x: f32) usize {
+    var pen: f32 = 0;
+    for (run.glyphs) |glyph| {
+        if (x < pen + glyph.x_advance * 0.5) return @min(glyph.cluster, text_len);
+        pen += glyph.x_advance;
+    }
+    return text_len;
 }

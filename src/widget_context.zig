@@ -38,6 +38,11 @@ pub const RegionOptions = struct {
     enabled: bool = true,
     focusable: bool = false,
 
+    // Whether the wheel reaches this region. Separate from `focusable` because
+    // most of a frame is neither, and a widget is commonly one without the
+    // other.
+    scrollable: bool = false,
+
     // Null takes the clip the canvas is under, which is the usual case. An
     // explicit one is for a widget whose interactive area is not the area it
     // draws in.
@@ -154,6 +159,7 @@ pub const Context = struct {
             .clip = options.clip orelse self.canvas.currentClip(),
             .enabled = options.enabled,
             .focusable = options.focusable,
+            .scrollable = options.scrollable,
         });
     }
 
@@ -278,6 +284,97 @@ pub const Context = struct {
         return changed;
     }
 
+    // Moves `offset` by whatever the frame's wheel did to a scrolling region,
+    // and reports whether it moved.
+    //
+    // Arithmetic and a lookup, with no drawing of its own: what a scrolling
+    // region looks like is a panel, a clip and rows placed `offset` higher,
+    // all of which the caller already has. Registering the region with
+    // `scrollable` is what makes the wheel reach it at all.
+    pub fn scroll(
+        self: *Context,
+        key: Key,
+        content: f32,
+        viewport: f32,
+        offset: *f32,
+    ) Error!bool {
+        const state = try self.interaction(key);
+        const next = try widgets.scrollOffset(offset.*, state.scroll.y, content, viewport);
+        const moved = next != offset.*;
+        offset.* = next;
+        return moved;
+    }
+
+    // Applies this frame's editing to a text field, and reports whether the
+    // text changed.
+    //
+    // **Separate from the drawing below, and called before it.** What is drawn
+    // is a run somebody shaped from the buffer, and the buffer is what this
+    // changes; folding the two into one call would draw the text as it stood
+    // before the keystroke and leave the typing one frame behind. A caller
+    // acts on the answer by shaping again, and then draws.
+    //
+    // `shaped` is the run as it was last drawn, which is what a click is
+    // resolved against: the user aimed at what was on the screen.
+    //
+    // The style is here for its padding, which is where the line starts and so
+    // what a pointer position is measured from. Passing the same style to both
+    // calls is what keeps the caret a click puts down under the pointer.
+    pub fn editText(
+        self: *Context,
+        key: Key,
+        rect: Rect,
+        style: widgets.TextFieldStyle,
+        buffer: []u8,
+        state: *widgets.TextFieldState,
+        shaped: widgets.Label,
+        enabled: bool,
+    ) Error!bool {
+        const interacted = try self.interaction(key);
+        const changed = try widgets.applyEdits(buffer, state, try self.editsFor(key), enabled);
+        if (enabled) placeCaretFromPointer(rect, style, state, shaped, interacted);
+        return changed;
+    }
+
+    // Draws a text field over the state `editText` left behind.
+    //
+    // The scroll is settled here and not there, because it is the only part
+    // that depends on the run: a caller that shaped again between the two
+    // calls has the current one by now, and the caret is kept in view against
+    // the line that is about to be drawn rather than the one before it.
+    pub fn textField(
+        self: *Context,
+        key: Key,
+        rect: Rect,
+        style: widgets.TextFieldStyle,
+        state: *widgets.TextFieldState,
+        shaped: widgets.Label,
+        enabled: bool,
+    ) Error!void {
+        const interacted = try self.interaction(key);
+        state.scroll = widgets.caretScroll(
+            state.scroll,
+            widgets.advanceTo(shaped.run, state.caret),
+            widgets.textFieldLine(rect, style).width,
+            shaped.advance,
+        );
+        return widgets.drawTextField(
+            self.canvas,
+            rect,
+            style,
+            state.*,
+            shaped,
+            interacted,
+            enabled,
+            self.image,
+        );
+    }
+
+    fn editsFor(self: *const Context, key: Key) Error![]const input.Edit {
+        if (self.pass != .drawing) return error.InvalidPhase;
+        return self.input_context.editsForId(self.ids.id(key));
+    }
+
     // Moves `value` by whatever the frame's input did to the slider, and
     // reports whether it moved.
     pub fn slider(
@@ -312,3 +409,29 @@ pub const Context = struct {
         return changed;
     }
 };
+
+// A click puts the caret where it landed, and a drag from it selects.
+//
+// The anchor moves only on the frame the press was taken, so every frame after
+// it moves the caret alone. That is the whole of what makes dragging select,
+// and it is why the press and the hold are told apart here rather than being
+// one case.
+fn placeCaretFromPointer(
+    rect: Rect,
+    style: widgets.TextFieldStyle,
+    state: *widgets.TextFieldState,
+    shaped: widgets.Label,
+    interacted: Interaction,
+) void {
+    if (interacted.capture != .primary and interacted.capture_began != .primary) return;
+    const pointer = interacted.pointer orelse return;
+
+    // Measured from the pen the run is drawn from, which is where the line
+    // starts less however far the field is scrolled along it.
+    const line = widgets.textFieldLine(rect, style);
+    const along = pointer.x - line.x + state.scroll;
+
+    const offset = widgets.offsetAt(shaped.run, state.len, along);
+    state.caret = offset;
+    if (interacted.capture_began == .primary) state.anchor = offset;
+}
