@@ -12,8 +12,8 @@ const Rect = res.Rect;
 const Vertex = res.Vertex2D;
 
 const white: res.PremultipliedColor = .white;
-const image: ImageHandle = @enumFromInt(1);
-const other_image: ImageHandle = @enumFromInt(2);
+const image: ImageHandle = @fromBackingInt(@intCast(1));
+const other_image: ImageHandle = @fromBackingInt(@intCast(2));
 const root: Rect = .{ .x = 0, .y = 0, .width = 1000, .height = 1000 };
 
 // The canvas holds slices, so a fixture is four arrays the test owns. Reading

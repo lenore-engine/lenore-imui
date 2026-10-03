@@ -15,7 +15,7 @@ const Region = imui.Region;
 const Vertex = res.Vertex2D;
 const WidgetContext = imui.WidgetContext;
 
-const image: ImageHandle = @enumFromInt(1);
+const image: ImageHandle = @fromBackingInt(@intCast(1));
 const root: Rect = .{ .x = 0, .y = 0, .width = 200, .height = 100 };
 const box: Rect = .{ .x = 10, .y = 10, .width = 60, .height = 20 };
 
@@ -118,7 +118,7 @@ test "a context needs an image to sample and room for its scopes" {
         &fixture.canvas,
         &fixture.scopes,
         0,
-        @enumFromInt(0),
+        @fromBackingInt(@intCast(0)),
     ));
     try testing.expectError(error.EmptyStorage, WidgetContext.init(
         &fixture.input_context,
@@ -573,7 +573,7 @@ const label_glyphs = [_]res.ShapedGlyph{
 };
 const label_placements = [_]res.GlyphPlacement{ label_ink, label_ink };
 
-const atlas: ImageHandle = @enumFromInt(2);
+const atlas: ImageHandle = @fromBackingInt(@intCast(2));
 
 const caption: imui.Label = .{
     .run = .{ .glyphs = &label_glyphs, .placements = &label_placements, .buckets = .whole },
@@ -638,9 +638,9 @@ const run_glyphs = [_]res.ShapedGlyph{
     .{ .index = 2, .cluster = 1, .x_advance = glyph_advance, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
     .{ .index = 3, .cluster = 2, .x_advance = glyph_advance, .y_advance = 0, .x_offset = 0, .y_offset = 0 },
 };
-const run_placements = [_]res.GlyphPlacement{
+const run_placements: [3]res.GlyphPlacement = @splat(
     .{ .left = 0, .top = 12, .width = 8, .height = 14, .u_min = 0, .v_min = 0, .u_max = 0.1, .v_max = 0.1 },
-} ** 3;
+);
 
 const shaped: imui.Label = .{
     .run = .{ .glyphs = &run_glyphs, .placements = &run_placements, .buckets = .whole },

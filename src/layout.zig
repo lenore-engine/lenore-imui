@@ -620,8 +620,8 @@ fn multiply(a: f32, b: f32) Error!f32 {
 // 4;` beside every layout, which is the numbering problem again with a nicer
 // spelling.
 //
-// Fields are read through `@typeInfo` rather than through `std.meta.fields`,
-// which neither the pinned toolchain nor master has.
+// Fields are read through `@typeInfo`. `std.meta.fields` is declared as a
+// compile error that points there (std/meta.zig).
 
 pub fn Branch(comptime Children: type) type {
     return struct {
@@ -723,11 +723,11 @@ pub fn define(comptime root_spec: anytype) type {
         }
 
         pub fn node(self: *Self, name: Name) *Node {
-            return &self.nodes[@intFromEnum(name)];
+            return &self.nodes[@backingInt(name)];
         }
 
         pub fn rect(self: *const Self, name: Name) LogicalRect {
-            return self.rects[@intFromEnum(name)];
+            return self.rects[@backingInt(name)];
         }
 
         pub fn solveLayout(self: *Self, root_rect: LogicalRect, workspace: Workspace) Error!void {
@@ -747,14 +747,14 @@ fn validateSpec(comptime spec: anytype, comptime name: []const u8) void {
     const children = @typeInfo(@TypeOf(spec.children));
     if (children != .@"struct")
         @compileError("the children of '" ++ name ++ "' must be a named struct literal");
-    inline for (children.@"struct".fields) |field|
-        validateSpec(@field(spec.children, field.name), field.name);
+    inline for (children.@"struct".field_names) |field_name|
+        validateSpec(@field(spec.children, field_name), field_name);
 }
 
 fn countSpecNodes(comptime spec: anytype) usize {
     var count: usize = 1;
-    inline for (@typeInfo(@TypeOf(spec.children)).@"struct".fields) |field|
-        count += countSpecNodes(@field(spec.children, field.name));
+    inline for (@typeInfo(@TypeOf(spec.children)).@"struct".field_names) |field_name|
+        count += countSpecNodes(@field(spec.children, field_name));
     return count;
 }
 
@@ -773,7 +773,7 @@ fn flattenSpec(
     node_cursor.* += 1;
     flat.names[index] = name;
 
-    const fields = @typeInfo(@TypeOf(spec.children)).@"struct".fields;
+    const fields = @typeInfo(@TypeOf(spec.children)).@"struct".field_names;
     var placed = spec.node;
     placed.child_start = @intCast(edge_cursor.*);
     placed.child_count = @intCast(fields.len);
@@ -783,11 +783,11 @@ fn flattenSpec(
     // that is itself a branch moves the cursor past them.
     const first_edge = edge_cursor.*;
     edge_cursor.* += fields.len;
-    inline for (fields, 0..) |field, offset| {
+    inline for (fields, 0..) |field_name, offset| {
         flat.edges[first_edge + offset] = @intCast(node_cursor.*);
         flattenSpec(
-            @field(spec.children, field.name),
-            field.name,
+            @field(spec.children, field_name),
+            field_name,
             flat,
             node_cursor,
             edge_cursor,

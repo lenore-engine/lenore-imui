@@ -13,7 +13,7 @@ const hitTestScrollable = imui.hitTestScrollable;
 const nowhere: res.Rect = .{ .x = -1000, .y = -1000, .width = 4000, .height = 4000 };
 
 fn id(value: u64) Id {
-    return @enumFromInt(value);
+    return @fromBackingInt(@intCast(value));
 }
 
 fn region(value: u64, rect: res.Rect) Region {

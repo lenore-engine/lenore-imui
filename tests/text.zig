@@ -16,7 +16,7 @@ const ShapedGlyph = res.ShapedGlyph;
 const Vertex = res.Vertex2D;
 
 const white: res.PremultipliedColor = .white;
-const atlas: ImageHandle = @enumFromInt(1);
+const atlas: ImageHandle = @fromBackingInt(@intCast(1));
 const root: Rect = .{ .x = 0, .y = 0, .width = 1000, .height = 1000 };
 
 const Fixture = struct {

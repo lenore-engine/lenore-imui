@@ -87,7 +87,7 @@ pub const Stack = struct {
     // The identity a widget would have here, without opening a scope. This is
     // what a leaf uses: it needs an identity and has no children to namespace.
     pub fn id(self: *const Stack, key: Key) Id {
-        return derive(@intFromEnum(self.current()), key);
+        return derive(@backingInt(self.current()), key);
     }
 
     // Opens a scope, which becomes the parent of everything derived until it is
@@ -138,5 +138,5 @@ fn derive(parent: u64, key: Key) Id {
     // Zero is the reserved "no widget", so the one digest that would collide
     // with it is moved aside. That makes 1 twice as likely as any other value,
     // which over a 64-bit space is not a rate anything above here can observe.
-    return @enumFromInt(if (value == 0) 1 else value);
+    return @fromBackingInt(@intCast(if (value == 0) 1 else value));
 }

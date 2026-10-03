@@ -13,7 +13,7 @@ const Rect = res.Rect;
 const SliderRange = imui.SliderRange;
 const Vertex = res.Vertex2D;
 
-const image: ImageHandle = @enumFromInt(1);
+const image: ImageHandle = @fromBackingInt(@intCast(1));
 const root: Rect = .{ .x = 0, .y = 0, .width = 1000, .height = 1000 };
 const box: Rect = .{ .x = 10, .y = 10, .width = 100, .height = 20 };
 

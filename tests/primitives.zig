@@ -12,7 +12,7 @@ const Rect = res.Rect;
 const Vertex = res.Vertex2D;
 
 const white: res.PremultipliedColor = .white;
-const image: ImageHandle = @enumFromInt(1);
+const image: ImageHandle = @fromBackingInt(@intCast(1));
 const root: Rect = .{ .x = 0, .y = 0, .width = 1000, .height = 1000 };
 
 const Fixture = struct {
@@ -260,7 +260,7 @@ test "every perimeter vertex is used by exactly two triangles" {
     var canvas = try fixture.started();
     try imui.addRoundedRect(&canvas, panel, radius, .{}, white, image);
 
-    var uses = [_]u32{0} ** fan_vertices;
+    var uses: [fan_vertices]u32 = @splat(0);
     var at: usize = 0;
     while (at < canvas.indexCount()) : (at += 3) {
         try testing.expectEqual(0, fixture.indices[at]);

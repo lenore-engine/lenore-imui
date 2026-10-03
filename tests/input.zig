@@ -14,7 +14,7 @@ const Token = imui.Token;
 const everywhere: res.Rect = .{ .x = -1000, .y = -1000, .width = 4000, .height = 4000 };
 
 fn id(value: u64) imui.Id {
-    return @enumFromInt(value);
+    return @fromBackingInt(@intCast(value));
 }
 
 fn at(x: f32, y: f32) Point {

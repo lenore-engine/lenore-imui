@@ -859,5 +859,5 @@ fn canFocus(region: Region) bool {
 // The modulo keeps the low bits, which is where a digest is as well mixed as
 // anywhere.
 fn slotFor(id: Id, len: usize) usize {
-    return @as(usize, @truncate(@intFromEnum(id))) % len;
+    return @as(usize, @truncate(@backingInt(id))) % len;
 }
