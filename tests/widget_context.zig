@@ -690,6 +690,30 @@ test "a field takes the frame's typing and reports the change" {
     try testing.expect(!try context.editText(field_key, box, field_style, &buffer, &state, shaped, true));
 }
 
+test "a field focused by its key takes the frame's typing without a click" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+    var buffer: [32]u8 = undefined;
+    var state: imui.TextFieldState = .{};
+
+    try context.beginFrame(root);
+    // Under a scope, so the key is resolved where the field was registered
+    // and not at the root.
+    try context.pushId(.{ .string = "console" });
+    try context.register(field_key, box, .{ .focusable = true });
+    try context.focus(field_key);
+    context.popId();
+    try context.beginRouting();
+    try testing.expectError(error.InvalidPhase, context.focus(field_key));
+    _ = try context.routeEvent(.{ .text = "ab" });
+    try context.finishRouting();
+
+    try context.pushId(.{ .string = "console" });
+    try testing.expect(try context.editText(field_key, box, field_style, &buffer, &state, shaped, true));
+    context.popId();
+    try testing.expectEqualStrings("ab", buffer[0..state.len]);
+}
+
 test "a click puts the caret where it landed" {
     var fixture: Fixture = .{};
     var context = try fixture.context();

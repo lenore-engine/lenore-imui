@@ -440,6 +440,28 @@ test "tab over a frame with nothing focusable takes nothing" {
     try testing.expect(!(try context.interaction(token)).focused);
 }
 
+test "focus given while registering takes the frame's typing" {
+    var fixture: Fixture = .{};
+    var context = try fixture.context();
+
+    try testing.expectError(error.InvalidPhase, context.focus(id(1)));
+
+    try context.beginFrame();
+    // Not yet registered this frame, so there is nothing the keys could reach.
+    try testing.expectError(error.UnknownId, context.focus(id(1)));
+    const field = try context.addRegion(focusable(1, 0));
+    const plain = try context.addRegion(box(2, 20));
+    try testing.expectError(error.NotFocusable, context.focus(id(2)));
+    try context.focus(id(1));
+    try context.beginRouting();
+    try testing.expectError(error.InvalidPhase, context.focus(id(1)));
+    try testing.expect(try context.routeEvent(typed("a")));
+    try context.finishRouting();
+
+    try testing.expect((try context.interaction(field)).focused);
+    try testing.expect(!(try context.interaction(plain)).focused);
+}
+
 test "escape gives the keyboard up and says it did" {
     var fixture: Fixture = .{};
     var context = try fixture.context();

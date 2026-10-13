@@ -163,6 +163,14 @@ pub const Context = struct {
         });
     }
 
+    // Gives the keyboard to the widget `key` names in the current scope, which
+    // this pass must already have registered. The field then takes this
+    // frame's typing as though it had been clicked.
+    pub fn focus(self: *Context, key: Key) Error!void {
+        if (self.pass != .registering) return error.InvalidPhase;
+        try self.input_context.focus(self.ids.id(key));
+    }
+
     pub fn beginRouting(self: *Context) Error!void {
         if (self.pass != .registering) return error.InvalidPhase;
         // Both stacks, because both name where a widget is: a clip left open

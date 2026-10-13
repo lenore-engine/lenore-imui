@@ -225,6 +225,11 @@ pub const Error = error{
 
     InvalidRegion,
 
+    // Focus asked for a region that is disabled or was registered without
+    // `focusable`. Refused rather than ignored, because a field the caller
+    // believes has the keyboard and does not is a silent dead input.
+    NotFocusable,
+
     // Two regions registered under one identity in one frame. Either the id
     // stack was not pushed where it should have been, or a loop is registering
     // its rows under a constant key.
@@ -427,6 +432,20 @@ pub const Context = struct {
         self.interactions[index] = .{};
         self.region_count += 1;
         return .{ .index = index, .epoch = self.epoch };
+    }
+
+    // Gives the keyboard to a region registered earlier in this frame, as a
+    // click on it would. For a field that opens already being typed into, such
+    // as a console opened by a key.
+    //
+    // Only while registering, and only for a region this frame has already
+    // registered: that is the one point where the identity is known to exist
+    // and the routing still ahead of it will deliver this frame's keys to it.
+    pub fn focus(self: *Context, region_id: Id) Error!void {
+        if (self.phase != .registering) return error.InvalidPhase;
+        const index = self.find(region_id) orelse return error.UnknownId;
+        if (!canFocus(self.regions[index])) return error.NotFocusable;
+        self.focused = region_id;
     }
 
     // Closes registration and opens routing.
